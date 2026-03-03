@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+service LedgerService {
+  rpc ReserveForOrder(ReserveForOrderRequest) returns (ReserveForOrderResponse);
+  rpc AdjustReservation(AdjustReservationRequest) returns (AdjustReservationResponse);
+  rpc ReleaseReservation(ReleaseReservationRequest) returns (ReleaseReservationResponse);
+  rpc ApplyFill(ApplyFillRequest) returns (ApplyFillResponse);
+  rpc GetBalances(GetBalancesRequest) returns (GetBalancesResponse);
+  rpc GetPositions(GetPositionsRequest) returns (GetPositionsResponse);
+}
+
+enum ReservationKind {
+  RESERVATION_KIND_UNSPECIFIED = 0;
+  RESERVATION_KIND_BUY_RESERVE = 1;
+  RESERVATION_KIND_SHORT_COLLATERAL_RESERVE = 2;
+  RESERVATION_KIND_FEE_RESERVE = 3;
+}
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  SIDE_BUY = 1;
+  SIDE_SELL = 2;
+}
+
+enum ReservationStatus {
+  RESERVATION_STATUS_UNSPECIFIED = 0;
+  RESERVATION_STATUS_ACTIVE = 1;
+  RESERVATION_STATUS_RELEASED = 2;
+  RESERVATION_STATUS_CONSUMED = 3;
+}
+
+message ReserveForOrderRequest {
+  string command_id = 1;
+  string reservation_id = 2;
+  string user_id = 3;
+  string order_id = 4;
+  ReservationKind kind = 5;
+  int64 amount_czk = 6;
+}
+
+message ReserveForOrderResponse {
+  bool ok = 1;
+  string reason = 2;
+}
+
+message AdjustReservationRequest {
+  string command_id = 1;
+  string reservation_id = 2;
+  int64 delta_czk = 3;
+}
+
+message AdjustReservationResponse {
+  bool ok = 1;
+  string reason = 2;
+}
+
+message ReleaseReservationRequest {
+  string command_id = 1;
+  string reservation_id = 2;
+}
+
+message ReleaseReservationResponse {
+  bool ok = 1;
+  string reason = 2;
+}
+
+message Party {
+  string user_id = 1;
+  string reservation_id = 2;
+  string order_id = 3;
+}
+
+message ApplyFillRequest {
+  string fill_id = 1;
+  Party maker = 2;
+  Party taker = 3;
+  string market_id = 4;
+  string outcome_id = 5;
+  int64 qty = 6;
+  int64 price_czk = 7;
+  Side taker_side = 8;
+  int64 fee_bps = 9;
+}
+
+message ApplyFillResponse {
+  bool ok = 1;
+  string reason = 2;
+  int64 notional_czk = 3;
+  int64 fee_czk = 4;
+}
+
+message GetBalancesRequest { string user_id = 1; }
+
+message GetBalancesResponse {
+  int64 available_czk = 1;
+  int64 reserved_czk = 2;
+}
+
+message Position {
+  string market_id = 1;
+  string outcome_id = 2;
+  int64 long_qty = 3;
+  int64 short_qty = 4;
+}
+
+message GetPositionsRequest { string user_id = 1; }
+
+message GetPositionsResponse { repeated Position positions = 1; }
