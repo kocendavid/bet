@@ -1,0 +1,40 @@
+{
+  "markets": {
+    "market-demo": {
+      "market_id": "market-demo",
+      "outcomes": [
+        "yes",
+        "no"
+      ],
+      "sources": [
+        "synthetic"
+      ],
+      "criteria": "synthetic test market",
+      "dispute_window_secs": 0,
+      "price_bands": {
+        "min_tick": 0,
+        "max_tick": 10000
+      },
+      "fee_config": {
+        "taker_fee_bps": 25
+      },
+      "state": "open",
+      "proposed_outcome_id": null,
+      "finalized_outcome_id": null,
+      "dispute_window_open_at_ms": null,
+      "dispute_window_close_at_ms": null,
+      "dispute": null,
+      "settlement_idempotency_key": null
+    }
+  },
+  "audit_events": [
+    {
+      "market_id": "market-demo",
+      "action": "create_market",
+      "from_state": null,
+      "to_state": "open",
+      "actor": "admin:admin-token",
+      "at_ms": 1772618181671
+    }
+  ]
+}

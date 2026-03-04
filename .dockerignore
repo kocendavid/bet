@@ -1,0 +1,15 @@
+.git
+.gitignore
+.DS_Store
+.idea
+.agents
+.codex
+.ralph
+
+# Build and runtime artifacts
+target
+matcher-data
+
+# Local scripts/docs not needed in runtime image
+docs
+scripts
