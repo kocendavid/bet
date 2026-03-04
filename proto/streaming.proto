@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package stream.v1;
+
+message EventEnvelope {
+  uint32 version = 1;
+  uint64 event_seq = 2;
+  string event_id = 3;
+  string source = 4;
+  string partition_key = 5;
+  int64 emitted_at_ms = 6;
+
+  oneof payload {
+    MarketTrade market_trade = 20;
+    MarketTopOfBook market_top_of_book = 21;
+    MarketDepthSnapshot market_depth_snapshot = 22;
+    UserOrderUpdate user_order_update = 23;
+    UserFill user_fill = 24;
+    UserBalanceUpdate user_balance_update = 25;
+    AuditEvent audit_event = 26;
+  }
+}
+
+message MarketTrade {
+  string market_id = 1;
+  string outcome_id = 2;
+  string fill_id = 3;
+  string maker_order_id = 4;
+  string taker_order_id = 5;
+  int64 price_czk = 6;
+  int64 qty = 7;
+}
+
+message MarketTopOfBook {
+  string market_id = 1;
+  string outcome_id = 2;
+  int64 best_bid_czk = 3;
+  int64 best_ask_czk = 4;
+}
+
+message MarketDepthLevel {
+  int64 price_czk = 1;
+  int64 qty = 2;
+}
+
+message MarketDepthSnapshot {
+  string market_id = 1;
+  string outcome_id = 2;
+  repeated MarketDepthLevel bids = 3;
+  repeated MarketDepthLevel asks = 4;
+}
+
+message UserOrderUpdate {
+  string user_id = 1;
+  string market_id = 2;
+  string outcome_id = 3;
+  string order_id = 4;
+  string state = 5;
+  string reason = 6;
+  int64 qty_remaining = 7;
+}
+
+message UserFill {
+  string user_id = 1;
+  string market_id = 2;
+  string outcome_id = 3;
+  string fill_id = 4;
+  string order_id = 5;
+  int64 price_czk = 6;
+  int64 qty = 7;
+}
+
+message UserBalanceUpdate {
+  string user_id = 1;
+  int64 available_czk = 2;
+  int64 reserved_czk = 3;
+}
+
+message AuditEvent {
+  string source = 1;
+  string payload_json = 2;
+}

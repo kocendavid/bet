@@ -1,8 +1,9 @@
 use anyhow::Context;
-use matcher_service::http::router;
+use matcher_service::http::{router, AppState};
 use matcher_service::ledger::GrpcLedgerAdapter;
 use matcher_service::risk::RiskLimits;
 use matcher_service::sharding::ShardRuntime;
+use matcher_service::streaming::{StaticTokenAuthorizer, StreamHub, WsAuthorizer};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -52,7 +53,18 @@ async fn main() -> anyhow::Result<()> {
     let runtime = ShardRuntime::new(shard_count, data_dir, ledger, 100, risk_limits)
         .context("initialize matcher service")?;
 
-    let app = router(std::sync::Arc::new(runtime));
+    let ws_queue_capacity: usize = std::env::var("MATCHER_WS_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let app_state = AppState {
+        runtime: std::sync::Arc::new(runtime),
+        stream_hub: std::sync::Arc::new(StreamHub::new()),
+        authorizer: std::sync::Arc::new(StaticTokenAuthorizer::from_env())
+            as std::sync::Arc<dyn WsAuthorizer>,
+        ws_queue_capacity,
+    };
+    let app = router(app_state);
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
