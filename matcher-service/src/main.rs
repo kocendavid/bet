@@ -1,7 +1,7 @@
 use anyhow::Context;
 use matcher_service::admin::{AdminAuthorizer, AdminController};
 use matcher_service::http::{router, AppState};
-use matcher_service::ledger::GrpcLedgerAdapter;
+use matcher_service::ledger::{AcceptAllLedgerAdapter, ConfiguredLedgerAdapter, GrpcLedgerAdapter};
 use matcher_service::risk::RiskLimits;
 use matcher_service::sharding::ShardRuntime;
 use matcher_service::streaming::{StaticTokenAuthorizer, StreamHub, WsAuthorizer};
@@ -17,13 +17,20 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("MATCHER_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let ledger_addr =
         std::env::var("LEDGER_GRPC_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".into());
+    let ledger_mode = std::env::var("MATCHER_LEDGER_MODE").unwrap_or_else(|_| "grpc".into());
     let shard_count: usize = std::env::var("MATCHER_SHARD_COUNT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
     let data_dir = std::env::var("MATCHER_DATA_DIR").unwrap_or_else(|_| "./matcher-data".into());
 
-    let ledger = GrpcLedgerAdapter::new(ledger_addr, 3, 50, 25);
+    let ledger = match ledger_mode.as_str() {
+        "accept_all" => ConfiguredLedgerAdapter::AcceptAll(AcceptAllLedgerAdapter),
+        "grpc" => ConfiguredLedgerAdapter::Grpc(GrpcLedgerAdapter::new(ledger_addr, 3, 50, 25)),
+        other => {
+            anyhow::bail!("invalid MATCHER_LEDGER_MODE `{other}`; expected `grpc` or `accept_all`")
+        }
+    };
     let risk_limits = RiskLimits {
         max_open_orders: std::env::var("RISK_MAX_OPEN_ORDERS")
             .ok()

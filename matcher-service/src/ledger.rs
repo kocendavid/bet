@@ -89,6 +89,15 @@ pub struct GrpcLedgerAdapter {
     fee_bps: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AcceptAllLedgerAdapter;
+
+#[derive(Clone)]
+pub enum ConfiguredLedgerAdapter {
+    Grpc(GrpcLedgerAdapter),
+    AcceptAll(AcceptAllLedgerAdapter),
+}
+
 impl GrpcLedgerAdapter {
     pub fn new(endpoint: String, max_retries: usize, retry_backoff_ms: u64, fee_bps: i64) -> Self {
         Self {
@@ -133,6 +142,157 @@ fn is_transient(status: &Status) -> bool {
         status.code(),
         Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::Unknown
     )
+}
+
+#[tonic::async_trait]
+impl LedgerAdapter for AcceptAllLedgerAdapter {
+    async fn reserve_for_order(
+        &self,
+        _command_id: &str,
+        _market_id: &str,
+        _outcome_id: &str,
+        _user_id: &str,
+        _order_id: &str,
+        _kind: ReservationKindLocal,
+        _amount_czk: i64,
+    ) -> Result<(), LedgerError> {
+        Ok(())
+    }
+
+    async fn release_reservation(
+        &self,
+        _command_id: &str,
+        _order_id: &str,
+    ) -> Result<(), LedgerError> {
+        Ok(())
+    }
+
+    async fn adjust_reservation(
+        &self,
+        _command_id: &str,
+        _order_id: &str,
+        _delta_czk: i64,
+    ) -> Result<(), LedgerError> {
+        Ok(())
+    }
+
+    async fn apply_fill(&self, _intent: FillIntent) -> Result<(), LedgerError> {
+        Ok(())
+    }
+
+    async fn settle_market(
+        &self,
+        _command_id: &str,
+        _idempotency_key: &str,
+        _market_id: &str,
+        _winning_outcome_id: &str,
+        _chunk_size: u32,
+    ) -> Result<(), LedgerError> {
+        Ok(())
+    }
+}
+
+#[tonic::async_trait]
+impl LedgerAdapter for ConfiguredLedgerAdapter {
+    async fn reserve_for_order(
+        &self,
+        command_id: &str,
+        market_id: &str,
+        outcome_id: &str,
+        user_id: &str,
+        order_id: &str,
+        kind: ReservationKindLocal,
+        amount_czk: i64,
+    ) -> Result<(), LedgerError> {
+        match self {
+            Self::Grpc(inner) => {
+                inner
+                    .reserve_for_order(
+                        command_id, market_id, outcome_id, user_id, order_id, kind, amount_czk,
+                    )
+                    .await
+            }
+            Self::AcceptAll(inner) => {
+                inner
+                    .reserve_for_order(
+                        command_id, market_id, outcome_id, user_id, order_id, kind, amount_czk,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn release_reservation(
+        &self,
+        command_id: &str,
+        order_id: &str,
+    ) -> Result<(), LedgerError> {
+        match self {
+            Self::Grpc(inner) => inner.release_reservation(command_id, order_id).await,
+            Self::AcceptAll(inner) => inner.release_reservation(command_id, order_id).await,
+        }
+    }
+
+    async fn adjust_reservation(
+        &self,
+        command_id: &str,
+        order_id: &str,
+        delta_czk: i64,
+    ) -> Result<(), LedgerError> {
+        match self {
+            Self::Grpc(inner) => {
+                inner
+                    .adjust_reservation(command_id, order_id, delta_czk)
+                    .await
+            }
+            Self::AcceptAll(inner) => {
+                inner
+                    .adjust_reservation(command_id, order_id, delta_czk)
+                    .await
+            }
+        }
+    }
+
+    async fn apply_fill(&self, intent: FillIntent) -> Result<(), LedgerError> {
+        match self {
+            Self::Grpc(inner) => inner.apply_fill(intent).await,
+            Self::AcceptAll(inner) => inner.apply_fill(intent).await,
+        }
+    }
+
+    async fn settle_market(
+        &self,
+        command_id: &str,
+        idempotency_key: &str,
+        market_id: &str,
+        winning_outcome_id: &str,
+        chunk_size: u32,
+    ) -> Result<(), LedgerError> {
+        match self {
+            Self::Grpc(inner) => {
+                inner
+                    .settle_market(
+                        command_id,
+                        idempotency_key,
+                        market_id,
+                        winning_outcome_id,
+                        chunk_size,
+                    )
+                    .await
+            }
+            Self::AcceptAll(inner) => {
+                inner
+                    .settle_market(
+                        command_id,
+                        idempotency_key,
+                        market_id,
+                        winning_outcome_id,
+                        chunk_size,
+                    )
+                    .await
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
