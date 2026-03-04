@@ -20,6 +20,8 @@ impl LedgerAdapter for MockLedger {
     async fn reserve_for_order(
         &self,
         _command_id: &str,
+        _market_id: &str,
+        _outcome_id: &str,
         _user_id: &str,
         order_id: &str,
         _kind: ReservationKindLocal,
@@ -51,6 +53,17 @@ impl LedgerAdapter for MockLedger {
 
     async fn apply_fill(&self, intent: FillIntent) -> Result<(), LedgerError> {
         self.fills.lock().await.push(intent.fill_id);
+        Ok(())
+    }
+
+    async fn settle_market(
+        &self,
+        _command_id: &str,
+        _idempotency_key: &str,
+        _market_id: &str,
+        _winning_outcome_id: &str,
+        _chunk_size: u32,
+    ) -> Result<(), LedgerError> {
         Ok(())
     }
 }

@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::pb::ledger_service_client::LedgerServiceClient;
 use crate::pb::{
     AdjustReservationRequest, ApplyFillRequest, Party, ReleaseReservationRequest, ReservationKind,
-    ReserveForOrderRequest, Side as LedgerSide,
+    ReserveForOrderRequest, SettleMarketRequest, Side as LedgerSide,
 };
 use thiserror::Error;
 use tonic::transport::Channel;
@@ -44,9 +44,12 @@ pub enum LedgerError {
 
 #[tonic::async_trait]
 pub trait LedgerAdapter: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     async fn reserve_for_order(
         &self,
         command_id: &str,
+        market_id: &str,
+        outcome_id: &str,
         user_id: &str,
         order_id: &str,
         kind: ReservationKindLocal,
@@ -67,6 +70,15 @@ pub trait LedgerAdapter: Send + Sync {
     ) -> Result<(), LedgerError>;
 
     async fn apply_fill(&self, intent: FillIntent) -> Result<(), LedgerError>;
+
+    async fn settle_market(
+        &self,
+        command_id: &str,
+        idempotency_key: &str,
+        market_id: &str,
+        winning_outcome_id: &str,
+        chunk_size: u32,
+    ) -> Result<(), LedgerError>;
 }
 
 #[derive(Clone)]
@@ -128,6 +140,8 @@ impl LedgerAdapter for GrpcLedgerAdapter {
     async fn reserve_for_order(
         &self,
         command_id: &str,
+        market_id: &str,
+        outcome_id: &str,
         user_id: &str,
         order_id: &str,
         kind: ReservationKindLocal,
@@ -145,6 +159,8 @@ impl LedgerAdapter for GrpcLedgerAdapter {
             order_id: order_id.to_string(),
             kind: kind_pb as i32,
             amount_czk,
+            market_id: market_id.to_string(),
+            outcome_id: outcome_id.to_string(),
         };
 
         let resp = self
@@ -243,6 +259,36 @@ impl LedgerAdapter for GrpcLedgerAdapter {
                 let mut c = client.clone();
                 let r = req.clone();
                 async move { c.apply_fill(r).await.map(|r| r.into_inner()) }
+            })
+            .await?;
+        if !resp.ok {
+            return Err(LedgerError::Rejected(resp.reason));
+        }
+        Ok(())
+    }
+
+    async fn settle_market(
+        &self,
+        command_id: &str,
+        idempotency_key: &str,
+        market_id: &str,
+        winning_outcome_id: &str,
+        chunk_size: u32,
+    ) -> Result<(), LedgerError> {
+        let client = self.client().await?;
+        let req = SettleMarketRequest {
+            command_id: command_id.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            market_id: market_id.to_string(),
+            winning_outcome_id: winning_outcome_id.to_string(),
+            chunk_size,
+        };
+
+        let resp = self
+            .with_retry(|| {
+                let mut c = client.clone();
+                let r = req.clone();
+                async move { c.settle_market(r).await.map(|r| r.into_inner()) }
             })
             .await?;
         if !resp.ok {

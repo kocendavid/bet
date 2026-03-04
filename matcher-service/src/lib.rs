@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod book;
 pub mod http;
 pub mod kafka;

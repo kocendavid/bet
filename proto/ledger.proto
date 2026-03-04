@@ -9,6 +9,7 @@ service LedgerService {
   rpc ApplyFill(ApplyFillRequest) returns (ApplyFillResponse);
   rpc GetBalances(GetBalancesRequest) returns (GetBalancesResponse);
   rpc GetPositions(GetPositionsRequest) returns (GetPositionsResponse);
+  rpc SettleMarket(SettleMarketRequest) returns (SettleMarketResponse);
 }
 
 enum ReservationKind {
@@ -38,6 +39,8 @@ message ReserveForOrderRequest {
   string order_id = 4;
   ReservationKind kind = 5;
   int64 amount_czk = 6;
+  string market_id = 7;
+  string outcome_id = 8;
 }
 
 message ReserveForOrderResponse {
@@ -108,3 +111,19 @@ message Position {
 message GetPositionsRequest { string user_id = 1; }
 
 message GetPositionsResponse { repeated Position positions = 1; }
+
+message SettleMarketRequest {
+  string command_id = 1;
+  string idempotency_key = 2;
+  string market_id = 3;
+  string winning_outcome_id = 4;
+  uint32 chunk_size = 5;
+}
+
+message SettleMarketResponse {
+  bool ok = 1;
+  string reason = 2;
+  bool idempotent = 3;
+  int64 processed_users = 4;
+  int64 released_reservations = 5;
+}

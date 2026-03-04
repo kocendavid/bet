@@ -1,7 +1,7 @@
 use ledger_service::pb::ledger_service_server::LedgerService;
 use ledger_service::pb::{
     ApplyFillRequest, GetBalancesRequest, GetPositionsRequest, Party, ReservationKind,
-    ReserveForOrderRequest, Side,
+    ReserveForOrderRequest, SettleMarketRequest, Side,
 };
 use ledger_service::service::LedgerGrpcService;
 use serial_test::serial;
@@ -58,6 +58,8 @@ async fn apply_fill_duplicate_fill_id_is_idempotent_noop() {
             order_id: "order-taker-1".into(),
             kind: ReservationKind::BuyReserve as i32,
             amount_czk: 505,
+            market_id: "m1".into(),
+            outcome_id: "o1".into(),
         }))
         .await
         .unwrap()
@@ -163,6 +165,8 @@ async fn concurrency_parallel_reserve_requests_preserve_invariants() {
                     order_id: format!("order-{i}"),
                     kind: ReservationKind::BuyReserve as i32,
                     amount_czk: 10,
+                    market_id: "m1".into(),
+                    outcome_id: "o1".into(),
                 }))
                 .await
         }));
@@ -188,4 +192,153 @@ async fn concurrency_parallel_reserve_requests_preserve_invariants() {
     assert!(reserved >= 0);
     assert_eq!(available + reserved, 1000);
     assert!(ok_count <= 100);
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn settle_market_is_correct_and_idempotent() {
+    let pool = setup_db().await;
+    let svc = LedgerGrpcService::new(pool.clone());
+
+    sqlx::query(
+        r#"
+        INSERT INTO wallets(user_id, available_czk, reserved_czk) VALUES
+          ('u_long_win', 500, 0),
+          ('u_long_lose', 100, 0),
+          ('u_short_win', 10_000, 0),
+          ('u_short_lose', 200, 0)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO positions(user_id, market_id, outcome_id, long_qty, short_qty) VALUES
+          ('u_long_win', 'm-settle', 'yes', 2, 0),
+          ('u_long_lose', 'm-settle', 'no', 3, 0),
+          ('u_short_win', 'm-settle', 'yes', 0, 1),
+          ('u_short_lose', 'm-settle', 'no', 0, 4)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let _ = svc
+        .reserve_for_order(Request::new(ReserveForOrderRequest {
+            command_id: "seed-reserve-1".into(),
+            reservation_id: "resv-m1-u1".into(),
+            user_id: "u_long_win".into(),
+            order_id: "o-resv-1".into(),
+            kind: ReservationKind::BuyReserve as i32,
+            amount_czk: 200,
+            market_id: "m-settle".into(),
+            outcome_id: "yes".into(),
+        }))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE reservations SET consumed_czk = 50 WHERE reservation_id = 'resv-m1-u1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let first = svc
+        .settle_market(Request::new(SettleMarketRequest {
+            command_id: "settle-cmd-1".into(),
+            idempotency_key: "settle-key-1".into(),
+            market_id: "m-settle".into(),
+            winning_outcome_id: "yes".into(),
+            chunk_size: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.ok);
+    assert!(!first.idempotent);
+    assert_eq!(first.processed_users, 4);
+    assert_eq!(first.released_reservations, 1);
+
+    let long_win = svc
+        .get_balances(Request::new(GetBalancesRequest {
+            user_id: "u_long_win".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(long_win.available_czk, 20_150);
+    assert_eq!(long_win.reserved_czk, 50);
+
+    let long_lose = svc
+        .get_balances(Request::new(GetBalancesRequest {
+            user_id: "u_long_lose".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(long_lose.available_czk, 100);
+    assert_eq!(long_lose.reserved_czk, 0);
+
+    let short_win = svc
+        .get_balances(Request::new(GetBalancesRequest {
+            user_id: "u_short_win".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(short_win.available_czk, 0);
+    assert_eq!(short_win.reserved_czk, 0);
+
+    let short_lose = svc
+        .get_balances(Request::new(GetBalancesRequest {
+            user_id: "u_short_lose".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(short_lose.available_czk, 200);
+    assert_eq!(short_lose.reserved_czk, 0);
+
+    let remaining_positions: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM positions WHERE market_id = 'm-settle' AND (long_qty <> 0 OR short_qty <> 0)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .get(0);
+    assert_eq!(remaining_positions, 0);
+
+    let second = svc
+        .settle_market(Request::new(SettleMarketRequest {
+            command_id: "settle-cmd-2".into(),
+            idempotency_key: "settle-key-1".into(),
+            market_id: "m-settle".into(),
+            winning_outcome_id: "yes".into(),
+            chunk_size: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(second.ok);
+    assert!(second.idempotent);
+    assert_eq!(second.reason, "idempotent replay");
+
+    let duplicate_key = svc
+        .settle_market(Request::new(SettleMarketRequest {
+            command_id: "settle-cmd-3".into(),
+            idempotency_key: "settle-key-2".into(),
+            market_id: "m-settle".into(),
+            winning_outcome_id: "yes".into(),
+            chunk_size: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!duplicate_key.ok);
+    assert_eq!(
+        duplicate_key.reason,
+        "market already settled with different idempotency key"
+    );
 }

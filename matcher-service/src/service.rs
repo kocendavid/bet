@@ -212,6 +212,8 @@ impl<L: LedgerAdapter> MatcherService<L> {
             .ledger
             .reserve_for_order(
                 &format!("{}:reserve", cmd.command_id),
+                &cmd.market_id,
+                &cmd.outcome_id,
                 &cmd.user_id,
                 &cmd.order_id,
                 reservation_kind,

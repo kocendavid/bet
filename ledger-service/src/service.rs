@@ -11,8 +11,10 @@ use crate::pb::{
     AdjustReservationRequest, AdjustReservationResponse, ApplyFillRequest, ApplyFillResponse,
     GetBalancesRequest, GetBalancesResponse, GetPositionsRequest, GetPositionsResponse, Position,
     ReleaseReservationRequest, ReleaseReservationResponse, ReserveForOrderRequest,
-    ReserveForOrderResponse, Side,
+    ReserveForOrderResponse, SettleMarketRequest, SettleMarketResponse, Side,
 };
+
+const FACE_CZK: i64 = 10_000;
 
 #[derive(Clone)]
 pub struct LedgerGrpcService {
@@ -279,6 +281,150 @@ async fn apply_sell_position(
     Ok(())
 }
 
+async fn settle_user_chunk(
+    tx: &mut Transaction<'_, Postgres>,
+    market_id: &str,
+    winning_outcome_id: &str,
+    after_user_id: &str,
+    chunk_size: i64,
+) -> Result<(i64, Option<String>), Status> {
+    let users = sqlx::query(
+        r#"
+        SELECT DISTINCT user_id
+        FROM positions
+        WHERE market_id = $1 AND user_id > $2
+        ORDER BY user_id
+        LIMIT $3
+        "#,
+    )
+    .bind(market_id)
+    .bind(after_user_id)
+    .bind(chunk_size)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(internal_error("settlement users query failed"))?;
+
+    if users.is_empty() {
+        return Ok((0, None));
+    }
+
+    let mut processed_users = 0_i64;
+    let mut last_user_id = None;
+    for row in users {
+        let user_id: String = row.get(0);
+        ensure_wallet(tx, &user_id).await?;
+
+        let sums = sqlx::query(
+            r#"
+            SELECT
+              COALESCE(SUM(CASE WHEN outcome_id = $2 THEN long_qty ELSE 0 END), 0) AS winning_long_qty,
+              COALESCE(SUM(CASE WHEN outcome_id = $2 THEN short_qty ELSE 0 END), 0) AS winning_short_qty
+            FROM positions
+            WHERE market_id = $1 AND user_id = $3
+            "#,
+        )
+        .bind(market_id)
+        .bind(winning_outcome_id)
+        .bind(&user_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(internal_error("settlement aggregate query failed"))?;
+
+        let winning_long_qty: i64 = sums.get(0);
+        let winning_short_qty: i64 = sums.get(1);
+
+        let payout_czk = winning_long_qty
+            .checked_mul(FACE_CZK)
+            .ok_or_else(|| Status::internal("payout overflow"))?;
+        let debit_czk = winning_short_qty
+            .checked_mul(FACE_CZK)
+            .ok_or_else(|| Status::internal("debit overflow"))?;
+
+        if payout_czk > 0 {
+            credit_wallet_available(tx, &user_id, payout_czk).await?;
+        }
+        if debit_czk > 0 {
+            debit_wallet_reserved_first(tx, &user_id, debit_czk).await?;
+        }
+
+        sqlx::query(
+            "UPDATE positions SET long_qty = 0, short_qty = 0 WHERE market_id = $1 AND user_id = $2",
+        )
+        .bind(market_id)
+        .bind(&user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal_error("position settlement update failed"))?;
+
+        processed_users += 1;
+        last_user_id = Some(user_id);
+    }
+
+    Ok((processed_users, last_user_id))
+}
+
+async fn release_market_reservation_chunk(
+    tx: &mut Transaction<'_, Postgres>,
+    market_id: &str,
+    after_reservation_id: &str,
+    chunk_size: i64,
+) -> Result<(i64, Option<String>), Status> {
+    let rows = sqlx::query(
+        r#"
+        SELECT reservation_id, user_id, amount_czk, consumed_czk
+        FROM reservations
+        WHERE market_id = $1
+          AND status = 'active'
+          AND reservation_id > $2
+        ORDER BY reservation_id
+        LIMIT $3
+        FOR UPDATE
+        "#,
+    )
+    .bind(market_id)
+    .bind(after_reservation_id)
+    .bind(chunk_size)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(internal_error("reservation release query failed"))?;
+
+    if rows.is_empty() {
+        return Ok((0, None));
+    }
+
+    let mut released = 0_i64;
+    let mut last_reservation_id = None;
+    for row in rows {
+        let reservation_id: String = row.get(0);
+        let user_id: String = row.get(1);
+        let amount_czk: i64 = row.get(2);
+        let consumed_czk: i64 = row.get(3);
+        let releasable = amount_czk - consumed_czk;
+        if releasable < 0 {
+            return Err(Status::internal("reservation invariant violated"));
+        }
+
+        if releasable > 0 {
+            let (available, reserved) = lock_wallet(tx, &user_id).await?;
+            if reserved < releasable {
+                return Err(Status::failed_precondition("reserved wallet underflow"));
+            }
+            update_wallet(tx, &user_id, available + releasable, reserved - releasable).await?;
+        }
+
+        sqlx::query("UPDATE reservations SET status='released' WHERE reservation_id=$1")
+            .bind(&reservation_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(internal_error("reservation release update failed"))?;
+
+        released += 1;
+        last_reservation_id = Some(reservation_id);
+    }
+
+    Ok((released, last_reservation_id))
+}
+
 #[tonic::async_trait]
 impl LedgerService for LedgerGrpcService {
     async fn reserve_for_order(
@@ -322,8 +468,18 @@ impl LedgerService for LedgerGrpcService {
         let kind = format!("{:?}", req.kind).to_lowercase();
         let insert = sqlx::query(
             r#"
-            INSERT INTO reservations(reservation_id, user_id, order_id, kind, amount_czk, consumed_czk, status)
-            VALUES($1, $2, $3, $4, $5, 0, 'active')
+            INSERT INTO reservations(
+              reservation_id,
+              user_id,
+              order_id,
+              kind,
+              amount_czk,
+              consumed_czk,
+              status,
+              market_id,
+              outcome_id
+            )
+            VALUES($1, $2, $3, $4, $5, 0, 'active', $6, $7)
             ON CONFLICT DO NOTHING
             "#,
         )
@@ -332,6 +488,8 @@ impl LedgerService for LedgerGrpcService {
         .bind(&req.order_id)
         .bind(kind)
         .bind(req.amount_czk)
+        .bind(&req.market_id)
+        .bind(&req.outcome_id)
         .execute(&mut *tx)
         .await
         .map_err(internal_error("reservation insert failed"))?;
@@ -685,6 +843,169 @@ impl LedgerService for LedgerGrpcService {
             notional_czk,
             fee_czk,
         }))
+    }
+
+    async fn settle_market(
+        &self,
+        request: Request<SettleMarketRequest>,
+    ) -> Result<Response<SettleMarketResponse>, Status> {
+        let req = request.into_inner();
+        if req.market_id.trim().is_empty() || req.winning_outcome_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "market_id and winning_outcome_id are required",
+            ));
+        }
+        if req.idempotency_key.trim().is_empty() {
+            return Err(Status::invalid_argument("idempotency_key is required"));
+        }
+        let chunk_size = i64::from(req.chunk_size.clamp(1, 5_000));
+
+        loop {
+            let mut tx = self.begin_serializable().await?;
+
+            let existing = sqlx::query(
+                r#"
+                SELECT idempotency_key, status, last_user_id, last_reservation_id, processed_users, released_reservations
+                FROM settlement_runs
+                WHERE market_id = $1
+                FOR UPDATE
+                "#,
+            )
+            .bind(&req.market_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal_error("settlement run lookup failed"))?;
+
+            let (last_user_id, last_reservation_id, mut processed_users, mut released_reservations) =
+                if let Some(row) = existing {
+                    let existing_key: String = row.get(0);
+                    let status: String = row.get(1);
+                    let last_user_id: String = row.get(2);
+                    let last_reservation_id: String = row.get(3);
+                    let processed_users: i64 = row.get(4);
+                    let released_reservations: i64 = row.get(5);
+
+                    if existing_key != req.idempotency_key {
+                        tx.commit().await.map_err(internal_error("commit failed"))?;
+                        return Ok(Response::new(SettleMarketResponse {
+                            ok: false,
+                            reason: "market already settled with different idempotency key".into(),
+                            idempotent: false,
+                            processed_users,
+                            released_reservations,
+                        }));
+                    }
+
+                    if status == "completed" {
+                        tx.commit().await.map_err(internal_error("commit failed"))?;
+                        return Ok(Response::new(SettleMarketResponse {
+                            ok: true,
+                            reason: "idempotent replay".into(),
+                            idempotent: true,
+                            processed_users,
+                            released_reservations,
+                        }));
+                    }
+
+                    (
+                        last_user_id,
+                        last_reservation_id,
+                        processed_users,
+                        released_reservations,
+                    )
+                } else {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO settlement_runs(
+                          market_id,
+                          idempotency_key,
+                          winning_outcome_id,
+                          status,
+                          last_user_id,
+                          last_reservation_id,
+                          processed_users,
+                          released_reservations
+                        )
+                        VALUES($1, $2, $3, 'in_progress', '', '', 0, 0)
+                        "#,
+                    )
+                    .bind(&req.market_id)
+                    .bind(&req.idempotency_key)
+                    .bind(&req.winning_outcome_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(internal_error("insert settlement run failed"))?;
+                    ("".to_string(), "".to_string(), 0_i64, 0_i64)
+                };
+
+            let (processed_chunk, next_user) = settle_user_chunk(
+                &mut tx,
+                &req.market_id,
+                &req.winning_outcome_id,
+                &last_user_id,
+                chunk_size,
+            )
+            .await?;
+            processed_users += processed_chunk;
+
+            let (released_chunk, next_reservation) = release_market_reservation_chunk(
+                &mut tx,
+                &req.market_id,
+                &last_reservation_id,
+                chunk_size,
+            )
+            .await?;
+            released_reservations += released_chunk;
+
+            let new_last_user = next_user.unwrap_or(last_user_id);
+            let new_last_reservation = next_reservation.unwrap_or(last_reservation_id);
+            let completed = processed_chunk == 0 && released_chunk == 0;
+
+            sqlx::query(
+                r#"
+                UPDATE settlement_runs
+                SET
+                  status = $2,
+                  last_user_id = $3,
+                  last_reservation_id = $4,
+                  processed_users = $5,
+                  released_reservations = $6,
+                  winning_outcome_id = $7,
+                  updated_at = NOW()
+                WHERE market_id = $1
+                "#,
+            )
+            .bind(&req.market_id)
+            .bind(if completed {
+                "completed"
+            } else {
+                "in_progress"
+            })
+            .bind(new_last_user)
+            .bind(new_last_reservation)
+            .bind(processed_users)
+            .bind(released_reservations)
+            .bind(&req.winning_outcome_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error("update settlement run failed"))?;
+
+            tx.commit().await.map_err(internal_error("commit failed"))?;
+
+            if completed {
+                info!(
+                    "audit settle_market market={} processed_users={} released_reservations={}",
+                    req.market_id, processed_users, released_reservations
+                );
+                return Ok(Response::new(SettleMarketResponse {
+                    ok: true,
+                    reason: "".into(),
+                    idempotent: false,
+                    processed_users,
+                    released_reservations,
+                }));
+            }
+        }
     }
 
     async fn get_balances(

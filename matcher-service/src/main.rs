@@ -1,4 +1,5 @@
 use anyhow::Context;
+use matcher_service::admin::{AdminAuthorizer, AdminController};
 use matcher_service::http::{router, AppState};
 use matcher_service::ledger::GrpcLedgerAdapter;
 use matcher_service::risk::RiskLimits;
@@ -50,8 +51,17 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(matcher_service::types::FACE_CZK),
     };
 
-    let runtime = ShardRuntime::new(shard_count, data_dir, ledger, 100, risk_limits)
-        .context("initialize matcher service")?;
+    let runtime = ShardRuntime::new(
+        shard_count,
+        data_dir.clone(),
+        ledger.clone(),
+        100,
+        risk_limits,
+    )
+    .context("initialize matcher service")?;
+    let admin = AdminController::new(data_dir, ledger)
+        .await
+        .context("initialize admin controller")?;
 
     let ws_queue_capacity: usize = std::env::var("MATCHER_WS_QUEUE_CAPACITY")
         .ok()
@@ -59,6 +69,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(256);
     let app_state = AppState {
         runtime: std::sync::Arc::new(runtime),
+        admin: std::sync::Arc::new(admin),
+        admin_authorizer: AdminAuthorizer::from_env(),
         stream_hub: std::sync::Arc::new(StreamHub::new()),
         authorizer: std::sync::Arc::new(StaticTokenAuthorizer::from_env())
             as std::sync::Arc<dyn WsAuthorizer>,

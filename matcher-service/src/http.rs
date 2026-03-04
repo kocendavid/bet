@@ -2,11 +2,16 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
+use crate::admin::{
+    AdminAuthorizer, AdminController, CreateMarketRequest, FileDisputeRequest,
+    FinalizeResolutionRequest, ProposeResolutionRequest, SettleMarketRequest,
+};
 use crate::ledger::LedgerAdapter;
 use crate::sharding::ShardRuntime;
 use crate::streaming::{
@@ -19,6 +24,8 @@ pub type SharedRuntime<L> = Arc<ShardRuntime<L>>;
 #[derive(Clone)]
 pub struct AppState<L: LedgerAdapter + Clone + 'static> {
     pub runtime: SharedRuntime<L>,
+    pub admin: Arc<AdminController<L>>,
+    pub admin_authorizer: AdminAuthorizer,
     pub stream_hub: Arc<StreamHub>,
     pub authorizer: Arc<dyn WsAuthorizer>,
     pub ws_queue_capacity: usize,
@@ -27,12 +34,29 @@ pub struct AppState<L: LedgerAdapter + Clone + 'static> {
 pub fn router<L: LedgerAdapter + Clone + 'static>(state: AppState<L>) -> Router {
     Router::new()
         .route("/orders", post(place_order::<L>))
-        .route("/orders/:order_id", delete(cancel_order::<L>))
-        .route("/books/:market_id/:outcome_id", get(get_book::<L>))
+        .route("/orders/{order_id}", delete(cancel_order::<L>))
+        .route("/books/{market_id}/{outcome_id}", get(get_book::<L>))
         .route("/ws", get(ws_stream::<L>))
         .route("/admin/migrate", post(migrate_market::<L>))
         .route("/admin/metrics", get(get_metrics::<L>))
-        .route("/admin/routing/:market_id", get(get_routing::<L>))
+        .route("/admin/routing/{market_id}", get(get_routing::<L>))
+        .route("/admin/markets", post(create_market::<L>))
+        .route(
+            "/admin/markets/{market_id}/resolution/propose",
+            post(propose_resolution::<L>),
+        )
+        .route(
+            "/admin/markets/{market_id}/disputes",
+            post(file_dispute::<L>),
+        )
+        .route(
+            "/admin/markets/{market_id}/resolution/finalize",
+            post(finalize_resolution::<L>),
+        )
+        .route(
+            "/admin/markets/{market_id}/settle",
+            post(settle_market::<L>),
+        )
         .with_state(state)
 }
 
@@ -204,8 +228,109 @@ async fn get_routing<L: LedgerAdapter + Clone>(
     })))
 }
 
+async fn create_market<L: LedgerAdapter + Clone>(
+    State(state): State<AppState<L>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateMarketRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = require_admin_actor(&state, &headers)?;
+    let market = state
+        .admin
+        .create_market(&actor, body)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(serde_json::json!({ "market": market })))
+}
+
+async fn propose_resolution<L: LedgerAdapter + Clone>(
+    Path(market_id): Path<String>,
+    State(state): State<AppState<L>>,
+    headers: HeaderMap,
+    Json(body): Json<ProposeResolutionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = require_admin_actor(&state, &headers)?;
+    let market = state
+        .admin
+        .propose_resolution(&actor, &market_id, body)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(serde_json::json!({ "market": market })))
+}
+
+async fn file_dispute<L: LedgerAdapter + Clone>(
+    Path(market_id): Path<String>,
+    State(state): State<AppState<L>>,
+    headers: HeaderMap,
+    Json(body): Json<FileDisputeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = require_admin_actor(&state, &headers)?;
+    let market = state
+        .admin
+        .file_dispute(&actor, &market_id, body)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(serde_json::json!({ "market": market })))
+}
+
+async fn finalize_resolution<L: LedgerAdapter + Clone>(
+    Path(market_id): Path<String>,
+    State(state): State<AppState<L>>,
+    headers: HeaderMap,
+    Json(body): Json<FinalizeResolutionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = require_admin_actor(&state, &headers)?;
+    let market = state
+        .admin
+        .finalize_resolution(&actor, &market_id, body)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(serde_json::json!({ "market": market })))
+}
+
+async fn settle_market<L: LedgerAdapter + Clone>(
+    Path(market_id): Path<String>,
+    State(state): State<AppState<L>>,
+    headers: HeaderMap,
+    Json(body): Json<SettleMarketRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let actor = require_admin_actor(&state, &headers)?;
+    let (market, outcome) = state
+        .admin
+        .settle_market(&actor, &market_id, body)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(serde_json::json!({
+        "market": market,
+        "idempotent": outcome.idempotent
+    })))
+}
+
 fn internal_error(err: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+}
+
+fn bad_request(err: anyhow::Error) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, err.to_string())
+}
+
+fn require_admin_actor<L: LedgerAdapter + Clone>(
+    state: &AppState<L>,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, String)> {
+    let Some(raw_token) = headers
+        .get("x-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    else {
+        return Err((StatusCode::UNAUTHORIZED, "missing admin token".into()));
+    };
+    let Some(role) = state.admin_authorizer.role_for_token(raw_token) else {
+        return Err((StatusCode::UNAUTHORIZED, "invalid admin token".into()));
+    };
+    if role != "admin" {
+        return Err((StatusCode::FORBIDDEN, "insufficient admin role".into()));
+    }
+    Ok(format!("admin:{raw_token}"))
 }
 
 async fn publish_stream_updates<L: LedgerAdapter + Clone>(
