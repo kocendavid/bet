@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Context};
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::book::BookState;
 use crate::ledger::{FillIntent, LedgerAdapter, LedgerError, ReservationKindLocal};
@@ -182,6 +183,12 @@ impl<L: LedgerAdapter> MatcherService<L> {
             return vec![Event::OrderRejected {
                 order_id: cmd.order_id.clone(),
                 reason: "invalid qty/price".into(),
+            }];
+        }
+        if Uuid::parse_str(&cmd.client_order_id).is_err() {
+            return vec![Event::OrderRejected {
+                order_id: cmd.order_id.clone(),
+                reason: "invalid client_order_id".into(),
             }];
         }
         if self.book.orders.contains_key(&cmd.order_id) {

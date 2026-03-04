@@ -6,6 +6,7 @@ use axum::http::{Request, StatusCode};
 use matcher_service::admin::{AdminAuthorizer, AdminController};
 use matcher_service::http::{router, AppState};
 use matcher_service::ledger::{FillIntent, LedgerAdapter, LedgerError, ReservationKindLocal};
+use matcher_service::order_index::OrderIndex;
 use matcher_service::risk::RiskLimits;
 use matcher_service::sharding::ShardRuntime;
 use matcher_service::streaming::{StaticTokenAuthorizer, StreamHub, WsAuthorizer};
@@ -91,6 +92,14 @@ async fn test_app(
 
     let app = router(AppState {
         runtime: Arc::new(runtime),
+        order_index: Arc::new(
+            OrderIndex::load(
+                std::path::Path::new(&data_path).join("admin/order-index.json"),
+                48 * 3600,
+            )
+            .await
+            .unwrap(),
+        ),
         admin: Arc::new(admin),
         admin_authorizer: AdminAuthorizer::from_env(),
         stream_hub: Arc::new(StreamHub::new()),

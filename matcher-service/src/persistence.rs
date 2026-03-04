@@ -47,6 +47,8 @@ struct PbPlace {
     user_id: String,
     #[prost(string, tag = "4")]
     order_id: String,
+    #[prost(string, tag = "9")]
+    client_order_id: String,
     #[prost(int32, tag = "5")]
     side: i32,
     #[prost(int32, tag = "6")]
@@ -278,6 +280,7 @@ fn command_to_pb(command: &Command) -> PbCommand {
                 outcome_id: c.outcome_id.clone(),
                 user_id: c.user_id.clone(),
                 order_id: c.order_id.clone(),
+                client_order_id: c.client_order_id.clone(),
                 side: side_to_i32(c.side),
                 order_type: order_type_to_i32(c.order_type),
                 limit_price: c.limit_price,
@@ -305,6 +308,7 @@ fn pb_to_command(pb: PbCommand) -> anyhow::Result<Command> {
             outcome_id: p.outcome_id,
             user_id: p.user_id,
             order_id: p.order_id,
+            client_order_id: p.client_order_id,
             side: side_from_i32(p.side)?,
             order_type: order_type_from_i32(p.order_type)?,
             limit_price: p.limit_price,

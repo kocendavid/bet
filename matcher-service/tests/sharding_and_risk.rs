@@ -76,11 +76,16 @@ fn place(
     limit_price: i64,
     qty: i64,
 ) -> Command {
+    let suffix = order_id
+        .bytes()
+        .fold(0_u64, |acc, b| acc.wrapping_mul(131).wrapping_add(b as u64))
+        % 1_000_000_000_000;
     Command::Place(PlaceOrder {
         command_id: cmd_id.to_string(),
         market_id: market_id.to_string(),
         outcome_id: outcome_id.to_string(),
         user_id: user_id.to_string(),
+        client_order_id: format!("00000000-0000-4000-8000-{suffix:012}"),
         order_id: order_id.to_string(),
         side,
         order_type,

@@ -287,17 +287,7 @@ impl<L: LedgerAdapter + Clone + 'static> ShardRuntime<L> {
         };
 
         let command_for_quality = command.clone();
-        let (tx, rx) = oneshot::channel();
-        self.senders[shard]
-            .send(ShardMessage::Process {
-                command,
-                response: tx,
-            })
-            .await
-            .map_err(|_| anyhow!("shard {shard} queue closed"))?;
-        let out = rx
-            .await
-            .map_err(|_| anyhow!("shard {shard} dropped response"))??;
+        let out = self.dispatch_to_shard(shard, command).await?;
         self.quality
             .record_command(
                 &command_for_quality,
@@ -307,6 +297,17 @@ impl<L: LedgerAdapter + Clone + 'static> ShardRuntime<L> {
             )
             .await;
         Ok(out)
+    }
+
+    pub async fn process_on_shard(
+        &self,
+        shard: usize,
+        command: Command,
+    ) -> anyhow::Result<CommandResult> {
+        if shard >= self.shard_count {
+            return Err(anyhow!("shard {shard} out of range"));
+        }
+        self.dispatch_to_shard(shard, command).await
     }
 
     pub async fn get_book(
@@ -414,6 +415,23 @@ impl<L: LedgerAdapter + Clone + 'static> ShardRuntime<L> {
 
     pub fn quality(&self) -> Arc<QualityCollector> {
         self.quality.clone()
+    }
+
+    async fn dispatch_to_shard(
+        &self,
+        shard: usize,
+        command: Command,
+    ) -> anyhow::Result<CommandResult> {
+        let (tx, rx) = oneshot::channel();
+        self.senders[shard]
+            .send(ShardMessage::Process {
+                command,
+                response: tx,
+            })
+            .await
+            .map_err(|_| anyhow!("shard {shard} queue closed"))?;
+        rx.await
+            .map_err(|_| anyhow!("shard {shard} dropped response"))?
     }
 }
 

@@ -2,6 +2,7 @@ use anyhow::Context;
 use matcher_service::admin::{AdminAuthorizer, AdminController};
 use matcher_service::http::{router, AppState};
 use matcher_service::ledger::{AcceptAllLedgerAdapter, ConfiguredLedgerAdapter, GrpcLedgerAdapter};
+use matcher_service::order_index::OrderIndex;
 use matcher_service::risk::RiskLimits;
 use matcher_service::sharding::ShardRuntime;
 use matcher_service::streaming::{StaticTokenAuthorizer, StreamHub, WsAuthorizer};
@@ -66,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         risk_limits,
     )
     .context("initialize matcher service")?;
-    let admin = AdminController::new(data_dir, ledger)
+    let admin = AdminController::new(data_dir.clone(), ledger)
         .await
         .context("initialize admin controller")?;
 
@@ -74,8 +75,19 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(256);
+    let order_index_ttl_hours: u64 = std::env::var("MATCHER_ORDER_INDEX_TTL_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48);
+    let order_index = OrderIndex::load(
+        std::path::Path::new(&data_dir).join("admin/order-index.json"),
+        order_index_ttl_hours.saturating_mul(3600),
+    )
+    .await
+    .context("initialize order index")?;
     let app_state = AppState {
         runtime: std::sync::Arc::new(runtime),
+        order_index: std::sync::Arc::new(order_index),
         admin: std::sync::Arc::new(admin),
         admin_authorizer: AdminAuthorizer::from_env(),
         stream_hub: std::sync::Arc::new(StreamHub::new()),

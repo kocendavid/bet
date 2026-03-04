@@ -35,6 +35,7 @@ async fn user_channel_delivers_ordered_lossless_critical_updates() {
         market_id: "m1".into(),
         outcome_id: "yes".into(),
         user_id: "u1".into(),
+        client_order_id: "00000000-0000-4000-8000-000000000001".into(),
         order_id: "o1".into(),
         side: Side::Buy,
         order_type: OrderType::Limit,

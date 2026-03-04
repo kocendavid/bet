@@ -22,6 +22,7 @@ pub struct PlaceOrder {
     pub market_id: String,
     pub outcome_id: String,
     pub user_id: String,
+    pub client_order_id: String,
     pub order_id: String,
     pub side: Side,
     pub order_type: OrderType,

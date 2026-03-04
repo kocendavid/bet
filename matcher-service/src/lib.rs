@@ -3,6 +3,7 @@ pub mod book;
 pub mod http;
 pub mod kafka;
 pub mod ledger;
+pub mod order_index;
 pub mod persistence;
 pub mod quality;
 pub mod risk;

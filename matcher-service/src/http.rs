@@ -14,18 +14,21 @@ use crate::admin::{
     FinalizeResolutionRequest, ProposeResolutionRequest, SettleMarketRequest,
 };
 use crate::ledger::LedgerAdapter;
+use crate::order_index::{OrderIndex, OrderStatus};
 use crate::quality::QualityFilter;
 use crate::sharding::ShardRuntime;
 use crate::streaming::{
     ChannelKind, StreamHub, StreamSubscription, SubscribeError, SubscriptionRequest, WsAuthorizer,
 };
 use crate::types::{CancelOrder, Command, CommandResult, PlaceOrder};
+use uuid::Uuid;
 
 pub type SharedRuntime<L> = Arc<ShardRuntime<L>>;
 
 #[derive(Clone)]
 pub struct AppState<L: LedgerAdapter + Clone + 'static> {
     pub runtime: SharedRuntime<L>,
+    pub order_index: Arc<OrderIndex>,
     pub admin: Arc<AdminController<L>>,
     pub admin_authorizer: AdminAuthorizer,
     pub stream_hub: Arc<StreamHub>,
@@ -72,17 +75,82 @@ async fn place_order<L: LedgerAdapter + Clone>(
     State(state): State<AppState<L>>,
     Json(req): Json<PlaceOrder>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let cmd = Command::Place(req.clone());
-    let out = state
-        .runtime
-        .process(cmd.clone())
+    if Uuid::parse_str(&req.client_order_id).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "client_order_id must be a UUID".into(),
+        ));
+    }
+    let shard_id = state.runtime.route_with_overrides(&req.market_id).await;
+    let (claimed, created) = state
+        .order_index
+        .claim_place_or_get_existing(
+            &req.user_id,
+            &req.order_id,
+            &req.client_order_id,
+            &req.market_id,
+            &req.outcome_id,
+            shard_id,
+        )
         .await
         .map_err(internal_error)?;
+    if !created {
+        return Ok(Json(serde_json::json!({
+            "command_id": req.command_id,
+            "order_id": claimed.order_id,
+            "client_order_id": claimed.client_order_id,
+            "market_id": claimed.market_id,
+            "shard_id": claimed.shard_id,
+            "status": claimed.current_status,
+            "idempotent_replay": true,
+            "events": []
+        })));
+    }
+
+    let cmd = Command::Place(req.clone());
+    let out = match state.runtime.process(cmd.clone()).await {
+        Ok(out) => out,
+        Err(err) => {
+            let _ = state
+                .order_index
+                .upsert(
+                    &req.user_id,
+                    &req.order_id,
+                    &req.client_order_id,
+                    &req.market_id,
+                    &req.outcome_id,
+                    shard_id,
+                    OrderStatus::Rejected,
+                )
+                .await;
+            return Err(internal_error(err));
+        }
+    };
 
     publish_stream_updates(&state, &cmd, &out).await;
 
+    let index_entry = state
+        .order_index
+        .apply_events(
+            &req.user_id,
+            &req.order_id,
+            &req.client_order_id,
+            &req.market_id,
+            &req.outcome_id,
+            shard_id,
+            &out.events,
+        )
+        .await
+        .map_err(internal_error)?;
+
     Ok(Json(serde_json::json!({
         "command_id": out.command_id,
+        "order_id": req.order_id,
+        "client_order_id": req.client_order_id,
+        "market_id": req.market_id,
+        "shard_id": shard_id,
+        "status": index_entry.current_status,
+        "idempotent_replay": false,
         "events": out.events
     })))
 }
@@ -90,9 +158,11 @@ async fn place_order<L: LedgerAdapter + Clone>(
 #[derive(Debug, Deserialize)]
 struct CancelBody {
     command_id: String,
-    market_id: String,
-    outcome_id: String,
     user_id: String,
+    #[serde(default)]
+    client_cancel_id: Option<String>,
+    #[serde(default)]
+    client_order_id: Option<String>,
 }
 
 async fn cancel_order<L: LedgerAdapter + Clone>(
@@ -100,24 +170,90 @@ async fn cancel_order<L: LedgerAdapter + Clone>(
     State(state): State<AppState<L>>,
     Json(body): Json<CancelBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let lookup_id = body.client_order_id.as_deref().unwrap_or(order_id.as_str());
+    let Some(index_entry) = state
+        .order_index
+        .lookup_by_order_or_client(&body.user_id, lookup_id)
+        .await
+    else {
+        return Ok(Json(serde_json::json!({
+            "command_id": body.command_id,
+            "status": "UNKNOWN_ORDER",
+            "order_id": order_id,
+            "recommendation": "query order history"
+        })));
+    };
+
+    if index_entry.current_status.is_terminal() {
+        return Ok(Json(serde_json::json!({
+            "command_id": body.command_id,
+            "status": "ALREADY_TERMINAL",
+            "order_id": index_entry.order_id,
+            "client_order_id": index_entry.client_order_id,
+            "terminal_state": index_entry.current_status,
+            "events": []
+        })));
+    }
+
     let cmd = Command::Cancel(CancelOrder {
-        command_id: body.command_id,
-        market_id: body.market_id,
-        outcome_id: body.outcome_id,
-        user_id: body.user_id,
-        order_id,
+        command_id: body
+            .client_cancel_id
+            .clone()
+            .unwrap_or_else(|| body.command_id.clone()),
+        market_id: index_entry.market_id.clone(),
+        outcome_id: index_entry.outcome_id.clone(),
+        user_id: body.user_id.clone(),
+        order_id: index_entry.order_id.clone(),
     });
 
-    let out = state
+    let out = match state
         .runtime
-        .process(cmd.clone())
+        .process_on_shard(index_entry.shard_id, cmd.clone())
         .await
-        .map_err(internal_error)?;
-
+    {
+        Ok(out) => out,
+        Err(_) => state
+            .runtime
+            .process(cmd.clone())
+            .await
+            .map_err(internal_error)?,
+    };
     publish_stream_updates(&state, &cmd, &out).await;
 
+    let mut cancel_status = "CANCEL_REQUESTED";
+    let mut terminal_state: Option<OrderStatus> = None;
+    if out
+        .events
+        .iter()
+        .any(|evt| matches!(evt, crate::types::Event::OrderCanceled { .. }))
+    {
+        let _ = state
+            .order_index
+            .apply_events(
+                &body.user_id,
+                &index_entry.order_id,
+                &index_entry.client_order_id,
+                &index_entry.market_id,
+                &index_entry.outcome_id,
+                index_entry.shard_id,
+                &out.events,
+            )
+            .await;
+    } else if is_not_found_rejection(&out) {
+        cancel_status = "ALREADY_TERMINAL";
+        terminal_state = if index_entry.current_status.is_terminal() {
+            Some(index_entry.current_status)
+        } else {
+            None
+        };
+    }
+
     Ok(Json(serde_json::json!({
-        "command_id": out.command_id,
+        "command_id": body.command_id,
+        "status": cancel_status,
+        "order_id": index_entry.order_id,
+        "client_order_id": index_entry.client_order_id,
+        "terminal_state": terminal_state,
         "events": out.events
     })))
 }
@@ -436,4 +572,14 @@ async fn run_ws_connection(
     }
 
     stream_hub.disconnect(connection_id).await;
+}
+
+fn is_not_found_rejection(out: &CommandResult) -> bool {
+    out.events.iter().any(|evt| {
+        matches!(
+            evt,
+            crate::types::Event::OrderRejected { reason, .. }
+            if reason == "order not found or not owned by user"
+        )
+    })
 }
