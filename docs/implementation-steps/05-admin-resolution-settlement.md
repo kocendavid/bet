@@ -42,6 +42,28 @@ Implement full market lifecycle controls: creation, dispute-aware resolution, an
 - Release all residual market-linked reservations.
 - Idempotency key per market settlement run.
 
+## Path Analysis (Lifecycle and Settlement)
+
+### Happy Paths
+
+- Admin creates market with valid config and state transitions `Open -> Proposed -> DisputeWindow -> Finalized -> Settled`.
+- No valid dispute during window allows timely finalization and deterministic settlement.
+- Settlement worker processes all position rows, applies payouts/debits, releases reservations, and records completion checkpoint.
+
+### Bad/Failure Paths
+
+- Unauthorized lifecycle action is rejected without state transition.
+- Finalize attempts before dispute window close are rejected.
+- Valid dispute filed in window transitions market to `InReview` and blocks finalization.
+- Duplicate settle command/rerun is idempotent and produces no net monetary drift.
+
+### Edge Cases
+
+- Boundary timestamp actions at dispute window open/close are evaluated consistently in one timezone policy.
+- Large markets settle in chunks across worker restarts without skipping or double-processing users.
+- Mixed user portfolios (long+short across outcomes) conserve total payout/debit invariants.
+- Late duplicate admin requests (retries) are safely de-duplicated by idempotency keys.
+
 ## Implementation Tasks
 
 1. Add admin auth and role checks for lifecycle endpoints.

@@ -55,6 +55,29 @@ Implement a deterministic single-outcome matching engine that performs synchrono
   - load latest snapshot,
   - replay log suffix.
 
+## Path Analysis (Core Flows)
+
+### Happy Paths
+
+- `PlaceOrder` passes validation and reservation, then fully matches and emits deterministic fill/order events.
+- `PlaceOrder` passes validation and reservation, partially matches, then rests remaining quantity at correct queue position.
+- `CancelOrder` for active open order removes it and releases reservation.
+- Restart recovery loads snapshot + replays log suffix to the same final state hash.
+
+### Bad/Failure Paths
+
+- Reservation rejection from Ledger causes `OrderRejected` with no order-book mutation.
+- Duplicate `command_id` is handled idempotently (no duplicate order/fills).
+- Cancel for non-existent/already-finalized order returns deterministic reject/no-op.
+- Transient Ledger RPC failures exhaust retries and reject command without partial book mutation.
+
+### Edge Cases
+
+- Self-trade prevention skips maker self-orders but continues deterministic walk across subsequent price levels.
+- IOC order with partial cross cancels exact remainder and releases only remainder reservation.
+- Two orders at same price preserve strict FIFO under replay and restart.
+- Snapshot boundary (command exactly at snapshot cutover) replays without double-apply or missed events.
+
 ## Implementation Tasks
 
 1. Implement order book data structures (bid/ask trees + per-level FIFO queue).

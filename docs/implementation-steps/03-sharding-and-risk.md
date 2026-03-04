@@ -40,6 +40,28 @@ Scale matcher execution to multiple markets/outcomes with deterministic shard ro
 - Replay on target shard and compare state hash.
 - Switch routing to target shard.
 
+## Path Analysis (Routing, Risk, Migration)
+
+### Happy Paths
+
+- Router consistently maps commands for each market to the expected shard.
+- Risk checks pass, reservation succeeds, and command execution proceeds deterministically.
+- Hot-market migration replays to identical state hash and routing flips with no command loss.
+
+### Bad/Failure Paths
+
+- Commands violating user/market limits are rejected before reservation and before book mutation.
+- Migration hash mismatch prevents cutover and keeps market on source shard.
+- Commands with malformed or missing market/outcome metadata are rejected deterministically.
+- Shard startup failure isolates only that shard and surfaces health signals without corrupting others.
+
+### Edge Cases
+
+- Boundary IDs around modulo transitions (`market_id` near shard bucket boundaries) remain stable across restarts.
+- Burst load on one hot shard while other shards are idle does not violate per-shard single-writer guarantees.
+- In-flight commands at freeze boundary are either fully included or excluded from migration segment (no split command effects).
+- Risk limits at exact thresholds (equal to max) behave consistently with policy (`allow` vs `reject`).
+
 ## Implementation Tasks
 
 1. Introduce book manager abstractions and shard runtime.

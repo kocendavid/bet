@@ -1,3 +1,3 @@
 [workspace]
-members = ["ledger-service"]
+members = ["ledger-service", "matcher-service"]
 resolver = "2"

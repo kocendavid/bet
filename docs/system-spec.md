@@ -1,334 +1,483 @@
-# Prediction Market Platform Spec
+# Custodial CZK N-way Prediction Exchange (CLOB) — Implementation Plan (Rust + Kafka + WebSockets)
 
-## Target Stack
-- Rust services
-- Kafka for downstream distribution
-- WebSockets for market data and user notifications
-- Postgres for canonical storage (ledger, markets, resolution)
-- Object storage (S3/MinIO) for snapshots/log segments if desired
-- Matching shards are single-writer deterministic state machines with append-only command log
+Scope: backend only. Strong consistency, strict non-negative balances, conservative short collateral, deterministic matching engine per shard, append-only logs + snapshots, Kafka for downstream only, WebSockets for market/user streaming.
 
-## Repository Layout and Shared Conventions
+One share settles to 100 CZK if the outcome wins, else 0.
 
-### Workspace
-- `crates/`
-- `common/` (ids, money types, time, serde, error, config, auth stubs)
-- `proto/` or `api/` (OpenAPI + generated types; or gRPC/prost)
-- `ledger/` (service + core domain)
-- `matcher/` (engine core + shard service)
-- `gateway-ws/` (websocket gateway + subscriptions)
-- `publisher-kafka/` (event publishing adapters)
-- `admin/` (market creation/resolution/disputes/settlement)
-- `testkit/` (fixtures, deterministic generators, in-proc harnesses)
+---
 
-### Hard Rules
-- All money is integer minor units: CZK is integer already, so `i64` in CZK.
-- Prices are fixed-point probability units: store as `i32` micros in `[0..1_000_000]`.
-- Display conversion: `p/1e6 * 100 CZK`.
-- Quantities are `i64` shares.
-- Every command has `command_id` (UUIDv7 or ULID) for idempotency.
-- Every fill has deterministic `fill_id` from `(shard, log_offset, match_index)` or UUID from matcher; ledger de-dupes.
-- Determinism: matcher cannot read wall-clock for ordering; only uses command log order + provided timestamps for display.
+## 0) Top-level architecture
 
-## Core Events (Internal Domain)
+### Services
+1) **Ledger Service (canonical)**
+- Owns: CZK balances (available + reserved), positions (long/short per market/outcome), fees, settlement accounting.
+- Guarantees: strict non-negative, idempotent application of fills/commands, atomic transfers.
 
-### Commands
-- `PlaceOrder`
-- `CancelOrder`
+2) **Matching Engine (single-writer per shard)**
+- Owns: order books + open orders + order state transitions.
+- Guarantees: deterministic price-time priority, IOC walking, log replay, snapshot recovery.
+- Does NOT mutate money; it requests ledger reservations and submits fill intents for ledger to apply.
 
-### Matcher Outputs
-- `OrderAccepted`
-- `OrderRejected`
+3) **Gateway API**
+- HTTP for: place/cancel, user queries (balances/positions), market metadata.
+- WebSockets for: user order/trade updates, market data streams.
+- AuthN/Z, rate limiting, request idempotency keys.
+
+4) **Kafka (downstream only)**
+- Consumers: market data fanout, portfolio projections, notifications, audits, risk monitoring, admin dashboards.
+- Correctness does not depend on Kafka.
+
+5) **Admin/Resolution Service**
+- Market creation, resolution posting, disputes/bonds, settlement triggering.
+- Calls Ledger for settlement finalization.
+
+### Storage
+- Ledger DB: Postgres (recommended) with SERIALIZABLE txns, or FoundationDB if you want strict transactional semantics across keys.
+- Matcher persistence: append-only **command log** + periodic **snapshot** files (local disk + object store).
+- Kafka: event distribution only.
+
+### Deterministic routing
+- `shard = market_id % shard_count` for default.
+- Support “hot market migration” by log replay into a dedicated shard.
+
+---
+
+## 1) Data model (core)
+
+### Identifiers
+- `UserId`, `MarketId`, `OutcomeId`, `OrderId`, `CommandId`, `FillId`, `TradeId`.
+- All externally supplied state-changing requests must include a unique `CommandId` (idempotency key).
+
+### Market / outcome
+- Market has N outcomes. Each outcome has its own order book.
+- Tick sizes:
+    - Price tick: e.g. 0.0001 probability units (0.01 CZK per share).
+    - Qty tick: integer shares.
+
+### Orders
+- `side`: Buy | Sell
+- `type`: Limit | IOC_MarketableLimit
+- `price`: limit price in [0,1] as fixed-point integer ticks.
+- `qty_total`, `qty_remaining`
+- `time_priority`: monotonic sequence number per book for determinism.
+
+### Positions
+Per user, per (market, outcome):
+- `long_qty` (u64)
+- `short_qty` (u64)
+  No netting initially (treat long and short separately), or store as signed but compute margin as conservative worst-case.
+
+### Wallet balances
+- `czk_available` (i64 >= 0)
+- `czk_reserved` (i64 >= 0)
+  Invariant: `czk_available + czk_reserved == total_czk` and never negative.
+
+### Reservations
+Reservation records keyed by `(user_id, reservation_id)`:
+- `kind`: BuyReserve | ShortCollateralReserve | FeeReserve
+- `amount_czk`
+- `linked_order_id` (optional)
+- `status`: Active | Released | Consumed
+  Support partial consumption and release.
+
+---
+
+## 2) Money math (must be exact)
+
+Use integer math only.
+
+- Face value: `FACE_CZK = 10000` if using “cents” (recommended); or 100 with halers if you want.
+- Represent price as integer ticks: `p_ticks` where `p = p_ticks / P_SCALE`.
+- Settlement payout per share: `FACE_CZK` for winner else 0.
+
+### Buy reservation
+For order qty `Q` and limit `P_limit`:
+- `reserve = Q * price_to_czk(P_limit) + fee_max`
+- If taker-only fee rate is `fee_bps`, compute worst-case fee against reserved notional:
+    - `notional_max = Q * price_to_czk(P_limit)`
+    - `fee_max = ceil(notional_max * fee_bps / 10000)`
+      Reserve at acceptance. Release unused after fills/cancel.
+
+### Short collateral reservation (conservative)
+For a sell that creates/extends short, reserve worst-case loss:
+- Proceeds: `Q * price_to_czk(P_limit_or_exec)`
+- Obligation if wins: `Q * FACE_CZK`
+- Worst-case loss: `Q * (FACE_CZK - price_to_czk(P))`
+  At order acceptance for resting sell limits, reserve on **limit price** for full unfilled qty:
+- `collat = Q_unfilled * (FACE_CZK - price_to_czk(P_limit))`
+  Add buffer: `collat *= (1 + buffer_bps/10000)` rounded up.
+
+As fills happen, reduce required collateral proportionally and release the excess.
+
+Important: fees on sells are charged on proceeds/notional; reserve separately or bake into required collateral.
+
+---
+
+## 3) API surface (backend-only)
+
+### HTTP (Gateway)
+- `POST /orders` PlaceOrder
+- `DELETE /orders/{order_id}` CancelOrder
+- `GET /markets`, `GET /markets/{id}`, `GET /books/{market}/{outcome}`
+- `GET /me/balances`, `GET /me/positions`, `GET /me/orders`
+
+Requests must include:
+- `command_id` (UUID)
+- `client_order_id` (optional, for UX)
+- auth token (JWT / session)
+
+### WebSockets
+Two channels:
+1) Market data:
+- `book_top`, `book_depth` (optional), `trades`, `mark_price` (derived)
+2) User:
+- `order_updates`, `fills`, `balance_updates`, `position_updates`
+
+WebSocket server consumes Kafka projections OR directly subscribes to internal fanout from matcher/ledger. If Kafka is delayed, user channel should prefer direct internal events for responsiveness (but do not make correctness depend on it).
+
+---
+
+## 4) Matching Engine (deterministic state machine)
+
+### Inputs (totally ordered per shard)
+- `PlaceOrder(cmd)`
+- `CancelOrder(cmd)`
+
+### Outputs (append-only)
+- `OrderAccepted | OrderRejected(reason)`
 - `OrderRested`
 - `OrderCanceled`
-- `TradeExecuted`
-- `OrderFilled` / `Partial`
+- `TradeExecuted{maker_order_id,taker_order_id, price, qty, fill_id}`
+- `OrderPartial | OrderFilled`
 - `BookLevelChanged`
 
-### Ledger Outputs
-- `ReservationCreated`
-- `ReservationReleased`
-- `ReservationAdjusted`
-- `BalanceDebited`
-- `BalanceCredited`
-- `PositionUpdated`
-- `FeeCharged`
-- `SettlementApplied`
+### Core invariants
+- Determinism: same input log => same outputs.
+- Price-time priority: best price first; within same price FIFO.
+- IOC marketable-limit: walk book until filled or limit reached; remainder canceled.
+- Self-trade prevention: do not match orders with same user_id. Policy: cancel taker remainder or skip resting order (choose and document one; recommend “skip and continue” for depth-walking, but ensure determinism).
 
-## Testing Baseline Across Services
-- Unit tests: pure domain logic.
-- Property tests (`proptest`): invariants (non-negative available, conservation, determinism).
-- Integration tests: Postgres + Kafka via testcontainers; in-proc matcher+ledger harness.
-- End-to-end tests: place orders -> trades -> portfolio views -> settlement, with crash/replay.
+### Matching algorithm (per outcome book)
+For taker order:
+- Determine crossing condition:
+    - Buy crosses asks with `ask_price <= limit_price`
+    - Sell crosses bids with `bid_price >= limit_price`
+- Iterate price levels in best-to-worse order while crossing and qty_remaining > 0:
+    - Match against FIFO queue at that level.
+    - Emit `TradeExecuted` per match chunk with unique `fill_id`.
+    - Update maker remaining, remove if filled.
+    - Update taker remaining.
+- If limit order and remaining > 0:
+    - Rest on book (after reservation already secured).
+- If IOC and remaining > 0:
+    - Cancel remainder.
 
-## Feature: Ledger with Reservations, Idempotent Transfers, Positions, Fees
+### Reservation / ledger interaction model (strong consistency)
+At order acceptance, matcher must ensure reservations exist BEFORE resting/IOC matching proceeds. Two viable patterns:
 
-### What It Does
-Canonical custodian ledger for CZK balances, reserved balances, and outcome positions (long/short).
+Pattern A (recommended): **Synchronous reservation check**
+1) Gateway sends PlaceOrder to matcher.
+2) Matcher calls ledger `ReserveForOrder` (sync RPC) with computed worst-case reserve.
+3) If ledger OK: matcher appends `OrderAccepted` and continues.
+4) If ledger rejects: matcher emits `OrderRejected(INSUFFICIENT_FUNDS)`.
 
-- Creates/adjusts/releases reservations at order acceptance and as fills occur.
-- Applies each fill atomically: CZK transfer, positions, fees, and reservation release/adjustment.
-- Enforces strict non-negative available balance: `available = balance - reserved >= 0` always.
+Pattern B: Two-phase via ledger-first
+1) Gateway calls ledger to create reservation.
+2) Gateway sends order with `reservation_id` to matcher.
+3) Matcher trusts reservation_id exists and is active.
 
-### Data Model (Postgres)
-- `accounts(user_id PK, balance_czk BIGINT, reserved_czk BIGINT, updated_at)`
-- `positions(user_id, market_id, outcome_id, long_qty BIGINT, short_qty BIGINT, PK(user_id, market_id, outcome_id))`
-- `reservations(reservation_id PK, user_id, market_id, outcome_id NULL, kind ENUM(buy,short), price_micros INT, qty_open BIGINT, amount_czk BIGINT, status, created_at)`
-- `idempotency(command_id PK, applied_at, result_hash, type)`
-- `applied_fills(fill_id PK, applied_at, shard_id, log_offset, payload_hash)`
-- `fees(...)` optional audit table
-- `transfers(ledger_entry_id PK, debit_user, credit_user, amount, reason, ref_id)`
+Pattern A is simpler operationally and keeps matcher the sole sequencer for user commands per market shard. Use gRPC between matcher and ledger.
 
-For buy:
-- `amount = qty_open * price_limit_czk_per_share + fee_reserve`
+---
 
-For short:
-- `amount = qty_open * 100 * (1 - p_limit) + buffer`
+## 5) Ledger service (canonical balances/positions)
 
-### Core APIs (Internal)
-- `ReserveForOrder(command_id, user_id, order_ref, kind, market_id, outcome_id, qty, price_limit_micros, fee_rate_bps, safety_buffer_bps) -> accepted/rejected + reservation_id`
-- `ReleaseReservation(command_id, reservation_id, amount)` / `CloseReservation(command_id, reservation_id)`
-- `ApplyFill(fill_id, taker, maker, market_id, outcome_id, qty, price_micros, taker_side, maker_order_ref, taker_order_ref, fee_rate_bps) -> applied/duplicate`
+### Responsibilities
+- Maintain balances and reservations; enforce non-negative.
+- Apply fills atomically:
+    - Transfer CZK between buyer and seller (proceeds).
+    - Charge taker fee.
+    - Update long/short positions.
+    - Consume/release reservations as appropriate.
+- Idempotency:
+    - `command_id` for reservation operations
+    - `fill_id` for fill application
+    - store processed ids with unique constraints.
 
-### Reservation Math
-Buy reserve:
-- `qty * (price_limit_micros/1e6)*100`, rounded up to CZK
-- plus taker fee reserve: `qty * price_limit_czk * fee_bps/10_000`, rounded up
+### Ledger RPCs (gRPC)
+- `ReserveForOrder(command_id, user_id, order_id, kind, amount_czk) -> ok|reject`
+- `AdjustReservation(order_id, delta_czk)` (downward releases typically)
+- `ReleaseReservation(order_id)` (on cancel/unfilled remainder)
+- `ApplyFill(fill_id, maker, taker, price_czk, qty, taker_side, order_ids, fees) -> ok`
+- `GetBalances/GetPositions`
 
-Short reserve:
-- `qty * 100 * (1 - p_limit)`
-- plus safety buffer: `ceil(base * buffer_bps/10_000)`
-- no netting across outcomes initially
+### Fill application details
+For each executed trade at price `P_exec` and qty `Q`:
+- Notional CZK = `Q * price_to_czk(P_exec)`
+- Buyer pays notional; seller receives notional.
+- Fee: charged to taker only:
+    - `fee = ceil(notional * fee_bps / 10000)`
+- Reservation consumption:
+    - Buyer: consume from buy reserve (notional + fee).
+    - Seller short collateral:
+        - If seller is shorting, consume/lock collateral reserve (already reserved on limit). On fill, update short position and recompute required collateral; release excess if exec price improves vs limit.
+    - Maker sell that is reducing long: proceeds are just credited; no collateral needed.
 
-### Fill Application
-If taker buys:
-- Taker pays `qty * price_czk + fee`
-- Maker receives `qty * price_czk`
-- Positions: taker long `+= qty`; maker short decreases if previously short
-- For maker sell behavior at launch: reduce long before increasing short for sells; reduce short before increasing long for buys while still reporting both
+Position updates (no netting):
+- If user buys: increase long_qty by Q (or reduce short if you implement netting later).
+- If user sells:
+    - If has long_qty >= Q: decrease long_qty by Q
+    - Else:
+        - sell_long = long_qty
+        - short_add = Q - sell_long
+        - long_qty becomes 0; short_qty += short_add
+        - collateral must cover full short_qty at relevant basis (use conservative “per-order reserved” model at launch).
 
-If taker sells:
-- Symmetric
-- Fee always charged to taker
+Note: If you truly avoid netting, selling while long would still create short in your model; that is undesirable. Recommend allowing “reduce long first” as above while still using conservative collateral for any remaining short.
 
-Reservation adjustments:
-- Buyer: reduce buy reservation by executed notional + executed fee; release remainder when order completes/cancels.
-- Seller short: reduce short reservation as open qty decreases, proportionally using limit price; release difference.
-- For sells that close existing long: acceptance can reserve full order qty at limit, then ledger releases excess after each fill using current position.
+---
 
-### Minimal Concise Doc (Deliverable)
-- `docs/ledger.md`: invariants, schemas, rounding rules, idempotency rules, reservation lifecycle, fill application tables.
+## 6) Risk controls (launch-minimum)
 
-### Robust Tests
-- Property: for any sequence of `Reserve/ApplyFill/Release`, `available >= 0`.
-- Property: idempotent `ApplyFill` does not change state on duplicate `fill_id`.
-- Unit: rounding edge cases (`p=0`, `p=1`, tiny qty, large qty).
-- Integration: concurrent `Reserve` on same account uses SERIALIZABLE or advisory locks to prevent overspend.
-- Crash test: apply fills, restart, reapply same fill stream, state unchanged.
+Enforce in Gateway or Matcher (prefer matcher for determinism), and ledger for monetary constraints.
 
-## Feature: Single-Shard Matching Engine for One Outcome Book; Then Generalize
+Per-user:
+- Max open orders
+- Max qty per order
+- Max notional per event
+- Max short exposure per event (in shares and in worst-case CZK)
 
-### What It Does
-Deterministic price-time matching for each outcome order book.
+Per event/outcome:
+- Price band:
+    - For each outcome, maintain `min_price_tick` and `max_price_tick` at creation time.
+    - Reject orders outside bands.
+- Marketable limit sanity:
+    - Reject IOC buys with Pmax above max band; similarly sells with Pmin below min band.
 
-- Accepts `PlaceOrder/CancelOrder` in total order (single writer per shard).
-- Emits trade executions and book deltas.
-- Persists command log and snapshots.
+Self-trade prevention:
+- Reject match if maker.user_id == taker.user_id.
+- Policy: skip that maker order and continue walking. If all remaining liquidity is self, IOC remainder cancels.
 
-### Engine Core (Pure Rust Library)
-- `Order`: `order_id, user_id, side, price_micros, qty_open, time_priority_seq, tif (GTC/IOC), self_trade_policy, reservation_id`
-- Book:
-- bids max-heap by price then seq
-- asks min-heap by price then seq
-- price levels map to FIFO queues
+---
 
-### Matching Algorithm
-`PlaceOrder`:
-- Validate price bands.
-- Validate qty limits.
-- If IOC: match opposing book until filled or limit reached; remainder cancels.
-- If GTC limit: match as much as possible; remainder rests.
+## 7) Persistence, replay, replication
 
-`CancelOrder`:
-- Remove if open; emit canceled.
+### Matcher persistence
+- Append-only command log per shard (or per market for easy migration):
+    - Record inputs: PlaceOrder, CancelOrder with full payload.
+    - Record outputs optionally for audit; outputs can be recomputed but storing helps debugging.
+- Snapshot:
+    - Periodically serialize books + open orders + sequence counters to snapshot file.
+    - Recovery: load latest snapshot + replay commands after snapshot offset.
 
-### Shard Service Responsibilities
-- Maintain command log: append Place/Cancel with monotonic offset.
-- On input, synchronously call ledger to create reservation before accepting order.
-- If ledger rejects: emit `OrderRejected`.
-- If ledger accepts: emit `OrderAccepted` and proceed to match/rest.
-- After generating fills, call ledger `ApplyFill` per fill in deterministic order.
-- On transient ledger failure, retry same `fill_id` until applied.
+### Hot standby
+- Replica process replays the same log and maintains identical state.
+- Leader election outside scope (use etcd/consul). Ensure only one writer.
 
-### Persistence
-- Log: file segments (e.g., `.log`) with CRC, length-prefix.
-- Snapshot: periodic serialized engine state (books + open orders + seq counters) to file/object storage; include `last_offset`.
-- Recovery: load latest snapshot, replay log from `last_offset+1`.
+### Migration
+- Copy log segment for market to new shard; replay to build state; cutover by routing switch at a command boundary.
 
-### Generalize to N Outcomes and Multiple Markets
-- Route by `market_id` to shard.
-- Inside shard, map `market_id -> MarketState`.
-- `MarketState` has N outcome books.
-- Commands include `(market_id, outcome_id)`.
+---
 
-### Minimal Concise Doc
-- `docs/matcher.md`: determinism rules, order priority, IOC walking, fill ordering, self-trade prevention, persistence formats, recovery.
+## 8) Kafka topics (downstream only)
 
-### Robust Tests
-- Golden tests: deterministic outputs for fixed command sequence (snapshot + event stream hash).
-- Property: book never negative qty; no crossed book after processing.
-- Property: price-time priority: earlier seq fills first at same price.
-- Restart: commands -> snapshot -> restart -> replay gives bitwise identical state and outputs.
-- Self-trade: opposing orders from same user do not match; explicit tested behavior.
+Suggested topics (partition by market_id for order):
+- `md.book_level_changed` (compacted optional)
+- `md.trades`
+- `user.order_updates` (partition by user_id)
+- `user.fills` (partition by user_id)
+- `user.balance_updates`
+- `audit.matcher_events`
+- `audit.ledger_events`
+- `admin.market_events`
+- `admin.resolution_events`
 
-## Feature: IOC Market-with-Slippage, Limit Orders, Cancellation
+Schema: protobuf or Avro with explicit versioning. Include monotonic `event_seq` per source for consumer ordering.
 
-### What It Does
-User API exposes:
-- Limit: side, outcome, price, qty, `tif=GTC`
-- Market-with-slippage: side, outcome, qty, `Pmax/Pmin` implemented as IOC + limit price
+---
 
-### Gateway HTTP API (No Frontend)
-- `POST /orders`
-- body: `{market_id, outcome_id, side, type: limit|market_slippage, price_micros?, qty, p_limit_micros?, client_order_id}`
-- `DELETE /orders/{order_id}`
-- `GET /orders`
-- `GET /orders/{id}`
+## 9) Resolution, disputes, settlement (A+B+C hybrid)
 
-### Flow
-- Gateway validates request, assigns `command_id`, routes to shard by `market_id`.
-- Shard does ledger reservation, matcher, ledger fills, emits outputs.
-- Gateway returns immediate ack with final IOC status (`filled/partial/canceled`) or accepted for resting.
+### Market metadata
+At creation:
+- Primary + secondary sources (URLs stored as text)
+- Explicit criteria and tie-break rules (stored immutable)
+- Dispute window duration
+- Dispute bond amount (CZK)
 
-### Minimal Concise Doc
-- `docs/orders.md`: request fields, rounding, IOC semantics, partial fill behavior, cancel semantics, error codes.
+### Resolution workflow
+1) Operator posts `proposed_outcome_id`, timestamp, evidence links.
+2) Dispute window opens.
+3) If dispute submitted with bond:
+    - mark `in_review`, freeze finalization.
+    - follow rulebook; operator decides bounded by sources/criteria.
+4) Finalize outcome.
 
-### Robust Tests
-- Integration: IOC buy walks multiple ask levels; confirm average execution and remainder canceled.
-- Limit GTC: partial match then rest; then cancel; confirm reservation released.
-- Fat-finger: price band violation -> reject, no reservation created.
+### Settlement (ledger-driven)
+For each market:
+- For each user outcome position:
+    - Winner long: credit `long_qty * FACE_CZK`
+    - Loser long: credit 0
+    - Winner short: debit `short_qty * FACE_CZK`
+    - Loser short: debit 0
+- Release all remaining reservations tied to that market.
+- Ensure strict non-negative: shorts should already have collateral reserved; settlement consumes reserved then available if needed (but should not be needed if model is correct). If still insufficient due to bug or admin adjustment, mark account as deficit and block withdrawals/trading (operator policy).
 
-## Feature: Sharding and Replication (Log + Snapshots), Then Downstream Kafka Distribution
+---
 
-### Sharding
-Deterministic routing:
-- `market_id % shard_count`
-- override table for hot market migration
+## 10) Implementation sequence (with acceptance criteria + tests)
 
-Migration approach:
-- Stop accepting commands for market on old shard at `cutover_offset`.
-- New shard loads snapshot + replays market log segment up to `cutover_offset`.
-- Gateway routing changes to new shard starting at `cutover+1`.
+### Phase 1 — Ledger MVP (reservations, idempotency, fills)
+Deliverables:
+- Postgres schema + migrations.
+- gRPC ledger API.
+- Reservation engine:
+    - Create, adjust, release.
+    - Enforce available >= reserve.
+- Fill application:
+    - atomic balance transfer
+    - taker fee
+    - position updates (reduce-long-first, else short)
+    - idempotency by fill_id unique constraint.
 
-### Replication
-- Hot standby tails primary log (or rsync/object storage) and replays near real-time.
-- Failover promotes replica at latest committed offset; gateway updates routing.
+Testing (robust):
+- Unit tests:
+    - price_to_czk conversions and rounding rules
+    - fee rounding
+    - collateral formulas
+- DB transaction tests:
+    - concurrent reservations against same wallet (SERIALIZABLE) never allow negative
+    - idempotent ApplyFill (same fill_id twice is no-op)
+- Property tests (proptest):
+    - invariant: available/reserved never negative
+    - invariant: total CZK conserved minus fees
+    - random sequences of reserve/adjust/release/applyfill
 
-### Kafka Distribution (Downstream Only)
-Topics:
-- `marketdata.book.v1` (BookLevelChanged, trades)
-- `orders.events.v1` (accepted/rested/canceled/filled)
-- `ledger.events.v1` (balances/positions/reservations)
-- `admin.resolution.v1` (market lifecycle)
+Acceptance criteria:
+- All invariants hold under concurrency test with 100+ parallel tasks.
+- Deterministic results for same sequence.
 
-Keying:
-- marketdata keyed by `(market_id, outcome_id)`
-- user streams keyed by `user_id`
+### Phase 2 — Single outcome matcher (one book) + synchronous reservations
+Deliverables:
+- Matcher process with:
+    - in-memory book
+    - PlaceOrder/CancelOrder
+    - deterministic matching
+    - sync ReserveForOrder calls
+- Command log + snapshot.
+- Basic HTTP gateway to submit commands and query state (no websockets yet).
 
-Guarantees:
-- Exactly-once not required; consumers de-dupe via `event_id`.
-- Producer should be idempotent and include monotonic shard offsets.
+Testing:
+- Golden tests:
+    - given input sequence, compare emitted trades/book states to fixtures
+- Determinism tests:
+    - replay log twice => identical hash of final state
+- Matching correctness:
+    - price-time priority
+    - partial fills across multiple levels
+    - IOC remainder cancels
+    - self-trade skip behavior deterministic
 
-### WebSockets Gateway
-- Subscribes to Kafka marketdata + user orders + user ledger streams.
-- Pushes with sequence numbers.
-- Stateless clients reconnect and resync via REST snapshots (`GET /book`, `GET /portfolio`) plus optional Kafka offset hints.
+Acceptance criteria:
+- All golden tests pass; replay stable.
 
-### Minimal Concise Docs
-- `docs/sharding.md`: routing, migration, replica replay, cutover invariants.
-- `docs/kafka.md`: topics, schemas, partition keys, ordering guarantees.
+### Phase 3 — N outcomes + multiple markets + sharding
+Deliverables:
+- Book manager keyed by (market_id,outcome_id).
+- Shard router (market_id % shard_count).
+- Market migration by log replay (operator-driven).
+- Limits: max open orders, size, notional, short exposure, price bands.
 
-### Robust Tests
-- Shard replay determinism: log -> state hash match.
-- Migration: move market, no lost/duplicated commands by `command_id`.
-- Kafka consumer contracts: backward-compatible schema evolution, de-dupe behavior.
+Testing:
+- Simulation tests:
+    - random markets/outcomes/orders; check invariants
+- Shard tests:
+    - routing stable
+    - migration preserves state hash
 
-## Feature: Admin Tools for Market Creation, Resolution, Disputes, Settlement
+Acceptance criteria:
+- Can run 2 shards locally; migrate one market without mismatches.
 
-### Market Creation
-Store:
-- `markets(market_id, N, outcomes, rules_json, sources_json, status, open/close times)`
+### Phase 4 — Kafka downstream + WebSockets
+Deliverables:
+- Kafka producer in matcher and ledger (or gateway) emitting events.
+- WebSocket server:
+    - market channels (trades, top-of-book, optionally depth)
+    - user channels (order/fill/balance updates)
+- Backpressure handling:
+    - bounded queues
+    - drop policy for non-critical market depth snapshots
 
-Plus:
-- price bands per outcome/event
-- risk limits per market
+Testing:
+- Contract tests for Kafka schemas (backward compatible).
+- WebSocket integration tests:
+    - connect, subscribe, receive expected stream on trades/cancels
+- Soak test:
+    - sustained order flow; ensure memory bounded.
 
-### Resolution + Dispute
-- `resolution_proposals(market_id, proposed_outcome_id, evidence_links, proposed_by, proposed_at)`
-- `disputes(market_id, disputed_by, bond_czk, disputed_at, status, notes)`
-- `final_resolution(market_id, outcome_id, finalized_at, finalized_by)`
+Acceptance criteria:
+- Kafka consumers can reconstruct top-of-book and last trades.
+- WebSocket stays stable under load.
 
-### Settlement
-For each user and outcome position:
-- Winner outcome: long pays `+100*qty`; short pays `-100*qty`.
-- Losing outcomes: long pays `0`; short pays `0` (short collateral released).
+### Phase 5 — Admin + Resolution + Settlement
+Deliverables:
+- Admin API:
+    - create market (N outcomes, sources, criteria, bands, fees)
+    - post resolution, dispute, finalize
+    - trigger settlement
+- Ledger settlement routine:
+    - iterate positions, apply payouts, release reserves
 
-Implement as idempotent ledger batch:
-- `ApplySettlement(market_id, settlement_id)` scans positions, posts transfers from house/escrow account, releases remaining reservations for that market, marks market settled.
+Testing:
+- Settlement tests:
+    - long winner paid, loser zero
+    - short winner debited, loser zero
+    - reserves released
+    - idempotent settlement (run twice no change)
+- Dispute window timing tests.
 
-Guidance:
-- Use a house account for conservation + auditability.
+Acceptance criteria:
+- End-to-end market lifecycle in integration test.
 
-### Minimal Concise Docs
-- `docs/markets.md`: lifecycle, creation fields, close/freeze, cancellation rules.
-- `docs/resolution.md`: proposal, dispute window, bonds, finalization, settlement math.
+---
 
-### Robust Tests
-- Settlement invariants: after settlement, reserved for market is 0; balances reflect payouts; total CZK conserved vs house adjustments.
-- Dispute flow: cannot finalize before window ends; bond lock/unlock rules enforced.
+## 11) Rust stack choices (recommended)
 
-## Implementation Sequence with Concrete Milestones
+- gRPC: `tonic`
+- HTTP: `axum`
+- WebSockets: `axum::extract::ws` or `tokio-tungstenite`
+- Kafka: `rdkafka`
+- Postgres: `sqlx` (compile-time checked queries) or `tokio-postgres`
+- Serialization: `prost` for protobuf (also for Kafka schemas)
+- Persistence: snapshots via `bincode` or `rkyv` (choose one; document versioning)
+- Testing:
+    - `proptest` for property tests
+    - `tokio::test` for async
+    - `testcontainers` for Postgres/Kafka integration tests
 
-### Milestone A: Ledger (2-3 weeks equivalent)
-- Domain + Postgres schema + idempotency tables
-- `ReserveForOrder` + `ApplyFill` + `Release`
-- Unit + property + integration tests
-- `docs/ledger.md`
+---
 
-### Milestone B: Matcher Single Market/Outcome
-- Engine core + log + snapshot + recovery
-- Ledger integration for reservation + fills
-- REST gateway for orders/cancel + basic queries
-- `docs/matcher.md`, `docs/orders.md`
-- Determinism + restart tests
+## 12) Operational notes (minimal but necessary)
 
-### Milestone C: N Outcomes + Multiple Markets
-- `MarketState` map and routing
-- Per-market limits + price bands
-- update `docs/markets.md`
-- broad integration tests
+- All monetary fields in smallest currency unit (integer).
+- All matcher operations single-threaded per shard for determinism; use message queue + one executor thread.
+- Ledger uses SERIALIZABLE or explicit row locking on wallet rows (`SELECT ... FOR UPDATE`) to prevent race conditions.
+- Observability:
+    - structured logs with `command_id`, `order_id`, `fill_id`
+    - metrics: order rate, reject rate, ledger tx latency, replay lag, websocket subscribers
 
-### Milestone D: Kafka + WebSockets + Portfolio Views
-- Event producers from matcher/ledger outputs
-- WebSocket subscriptions; REST snapshots
-- `docs/kafka.md`
+---
 
-### Milestone E: Sharding + Replication + Migration
-- Multi-shard deployment, routing table, migration replay
-- Replica hot standby
-- `docs/sharding.md`
+## 13) Definition of done (launch core)
 
-### Milestone F: Admin + Resolution/Disputes + Settlement
-- Admin API/CLI
-- Settlement batch with idempotency
-- `docs/resolution.md`
+- Place/cancel orders (limit + IOC marketable limit).
+- Strict non-negative balances with reservations.
+- Conservative short collateral with buffer.
+- Deterministic matcher with replay + snapshot recovery.
+- Taker-only fees enforced and reserved.
+- Basic risk limits + self-trade prevention.
+- Kafka + WebSockets for downstream/UX.
+- Admin lifecycle: create market, resolve, dispute, settle.
+- Comprehensive unit + property + integration tests; CI runs all.
 
-## Non-Negotiable Invariants
-Assert everywhere (tests + runtime checks):
-- `available_czk = balance - reserved >= 0` always.
-- No order accepted without `reservation_id` (unless maker-free features later).
-- Every fill applied at most once (`fill_id` unique) and refers to existing open orders.
-- Matcher output stream is deterministic given command log.
-- Book never crosses after processing (`best_bid < best_ask` unless empty).
-- IOC remainder always canceled; GTC remainder always rested.
-- Self-trade is prevented by explicit policy and tested.
+---
