@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Matcher Quality Dashboard</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #101a2b;
+      --line: #263246;
+      --text: #d5dfef;
+      --muted: #8fa0bb;
+      --good: #2fbf71;
+      --warn: #f7b955;
+      --bad: #f05a5a;
+      --buy: #2fbf71;
+      --sell: #f05a5a;
+      --mid: #f1c75b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 85% 0%, #182640 0%, transparent 42%),
+        radial-gradient(circle at 10% 100%, #14243c 0%, transparent 38%),
+        var(--bg);
+      min-height: 100vh;
+      padding: 16px;
+    }
+    h1 { margin: 0 0 10px; font-size: 20px; }
+    .panel {
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(20, 30, 48, 0.93), rgba(14, 22, 36, 0.93));
+      border-radius: 12px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .grid { display: grid; gap: 12px; }
+    .cols4 { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+    .cols2 { grid-template-columns: 1fr 1fr; }
+    .cols3 { grid-template-columns: 1.2fr 1fr 1fr; }
+    .label { color: var(--muted); font-size: 12px; text-transform: uppercase; }
+    .value { font-size: 22px; margin-top: 6px; }
+    .controls { display: grid; gap: 8px; grid-template-columns: 1fr 1fr 1fr 110px 110px 120px; }
+    .trade-controls { display: grid; gap: 8px; grid-template-columns: 120px 120px 1fr 120px; }
+    input, select, button {
+      width: 100%;
+      color: var(--text);
+      background: #0a121e;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 8px;
+      font: inherit;
+      font-size: 12px;
+    }
+    button { cursor: pointer; background: linear-gradient(180deg, #184f8a, #103560); border-color: #2668ad; }
+    button.cancel { background: linear-gradient(180deg, #6a2d2d, #4a2020); border-color: #8b3e3e; }
+    .sev { font-weight: 700; text-transform: uppercase; letter-spacing: .4px; }
+    .sev.ok { color: var(--good); }
+    .sev.warn { color: var(--warn); }
+    .sev.critical { color: var(--bad); }
+    #alertBanner { display: none; padding: 10px; border-radius: 8px; border: 1px solid #9e3232; background: rgba(104, 24, 24, 0.55); margin-bottom: 12px; }
+    canvas { width: 100%; height: 220px; border: 1px solid var(--line); border-radius: 8px; background: rgba(7,12,20,0.95); }
+    .legend { display: flex; gap: 12px; color: var(--muted); font-size: 12px; margin-top: 6px; }
+    .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 99px; }
+    .l-bid::before { background: var(--buy); }
+    .l-ask::before { background: var(--sell); }
+    .l-mid::before { background: var(--mid); }
+    .l-tput::before { background: #66b3ff; }
+    .l-rej::before { background: #ff8e55; }
+    .l-lat::before { background: #bb9bff; }
+    .split { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
+    .levels { display: grid; gap: 6px; margin-top: 8px; }
+    .level { display: grid; grid-template-columns: 66px 66px 1fr; align-items: center; gap: 6px; font-size: 12px; }
+    .bar { height: 14px; border: 1px solid #2e3f56; border-radius: 4px; overflow: hidden; background: #152338; }
+    .fill { height: 100%; }
+    .fill.bid { background: linear-gradient(to right, #1f7a4b, #2fbf71); }
+    .fill.ask { background: linear-gradient(to right, #a03f3f, #f05a5a); }
+    .table-wrap { overflow: auto; max-height: 260px; border: 1px solid var(--line); border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { border-bottom: 1px solid #253449; padding: 8px; white-space: nowrap; text-align: left; }
+    th { position: sticky; top: 0; background: #0f1928; color: var(--muted); }
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .warn { color: var(--warn); }
+    #events { margin: 0; padding-left: 18px; max-height: 160px; overflow: auto; color: var(--muted); font-size: 12px; }
+    @media (max-width: 1100px) {
+      .controls, .trade-controls { grid-template-columns: 1fr; }
+      .cols2, .cols3, .split { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Matcher Quality + Trading Dashboard</h1>
+
+  <div id="alertBanner"></div>
+
+  <div class="panel">
+    <div class="controls">
+      <input id="market" placeholder="market_id" value="market-demo" />
+      <input id="outcome" placeholder="outcome_id" value="yes" />
+      <input id="user" placeholder="your user_id" value="you-001" />
+      <select id="qualityScope">
+        <option value="global">quality: global</option>
+        <option value="filtered">quality: filtered</option>
+      </select>
+      <select id="window">
+        <option value="1m">window: 1m</option>
+        <option value="5m" selected>window: 5m</option>
+        <option value="15m">window: 15m</option>
+      </select>
+      <button id="apply">Apply</button>
+    </div>
+    <div class="label">Polls `/admin/quality` and selected `/books/{market}/{outcome}` every second.</div>
+  </div>
+
+  <div class="grid cols4">
+    <div class="panel"><div class="label">Severity</div><div id="sev" class="value sev ok">OK</div></div>
+    <div class="panel"><div class="label">Throughput/s</div><div id="throughput" class="value">0.00</div></div>
+    <div class="panel"><div class="label">Reject Rate</div><div id="rejectRate" class="value">0.00%</div></div>
+    <div class="panel"><div class="label">Latency p95</div><div id="latP95" class="value">0 ms</div></div>
+  </div>
+
+  <div class="grid cols4">
+    <div class="panel"><div class="label">Ingress</div><div id="ingress" class="value">0</div></div>
+    <div class="panel"><div class="label">Accepted</div><div id="accepted" class="value">0</div></div>
+    <div class="panel"><div class="label">Rejected</div><div id="rejected" class="value">0</div></div>
+    <div class="panel"><div class="label">Risk Rejects</div><div id="riskReject" class="value">0</div></div>
+  </div>
+
+  <div class="grid cols3">
+    <div class="panel">
+      <div class="label">Quality Trend (window snapshots)</div>
+      <canvas id="qualityChart" width="1100" height="250"></canvas>
+      <div class="legend">
+        <span class="l-tput">throughput/s</span>
+        <span class="l-rej">reject %</span>
+        <span class="l-lat">p95 latency ms</span>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="label">Reject Reasons</div>
+      <div class="table-wrap" style="max-height:240px;">
+        <table>
+          <thead><tr><th>reason</th><th>count</th><th>share</th></tr></thead>
+          <tbody id="reasonRows"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="label">Shard Balance</div>
+      <div id="shards" style="font-size:12px; margin-top:8px; color:var(--muted)">-</div>
+      <div class="label" style="margin-top:10px;">Streaming Deltas</div>
+      <div id="streamDeltas" style="font-size:12px; margin-top:8px; color:var(--muted)">-</div>
+    </div>
+  </div>
+
+  <div class="grid cols2">
+    <div class="panel">
+      <div class="label">Price Graph (bid / ask / mid)</div>
+      <canvas id="priceChart" width="1100" height="250"></canvas>
+      <div class="legend">
+        <span class="l-bid">bid</span>
+        <span class="l-ask">ask</span>
+        <span class="l-mid">mid</span>
+      </div>
+      <div class="split" style="margin-top:8px;">
+        <div>
+          <div class="label">Bids</div>
+          <div id="bids" class="levels"></div>
+        </div>
+        <div>
+          <div class="label">Asks</div>
+          <div id="asks" class="levels"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="label">Place Bet</div>
+      <div class="trade-controls">
+        <select id="side"><option value="buy">buy</option><option value="sell">sell</option></select>
+        <input id="price" type="number" min="0" max="10000" value="5000" />
+        <input id="qty" type="number" min="1" value="10" />
+        <button id="place">Place</button>
+      </div>
+      <div id="tradeMsg" class="label" style="min-height:18px; margin-top:8px;"></div>
+
+      <div class="label" style="margin-top:10px;">My Bets</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>order</th><th>side</th><th>price</th><th>qty</th><th>left</th><th>status</th><th>how doing</th><th>action</th></tr></thead>
+          <tbody id="myOrders"></tbody>
+        </table>
+      </div>
+
+      <div class="label" style="margin-top:10px;">Recent Events</div>
+      <ol id="events"></ol>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      market: localStorage.getItem("dash_market") || "market-demo",
+      outcome: localStorage.getItem("dash_outcome") || "yes",
+      user: localStorage.getItem("dash_user") || "you-001",
+      qualityScope: localStorage.getItem("dash_quality_scope") || "global",
+      window: localStorage.getItem("dash_quality_window") || "5m",
+      myOrders: new Map(),
+      priceHistory: [],
+      qualityHistory: [],
+      maxPoints: 120,
+      events: [],
+      lastBook: null,
+      currentQuality: null,
+      inFlight: false
+    };
+
+    const el = {
+      market: document.getElementById("market"),
+      outcome: document.getElementById("outcome"),
+      user: document.getElementById("user"),
+      qualityScope: document.getElementById("qualityScope"),
+      window: document.getElementById("window"),
+      sev: document.getElementById("sev"),
+      throughput: document.getElementById("throughput"),
+      rejectRate: document.getElementById("rejectRate"),
+      latP95: document.getElementById("latP95"),
+      ingress: document.getElementById("ingress"),
+      accepted: document.getElementById("accepted"),
+      rejected: document.getElementById("rejected"),
+      riskReject: document.getElementById("riskReject"),
+      reasonRows: document.getElementById("reasonRows"),
+      shards: document.getElementById("shards"),
+      streamDeltas: document.getElementById("streamDeltas"),
+      alertBanner: document.getElementById("alertBanner"),
+      qualityChart: document.getElementById("qualityChart"),
+      priceChart: document.getElementById("priceChart"),
+      bids: document.getElementById("bids"),
+      asks: document.getElementById("asks"),
+      side: document.getElementById("side"),
+      price: document.getElementById("price"),
+      qty: document.getElementById("qty"),
+      place: document.getElementById("place"),
+      tradeMsg: document.getElementById("tradeMsg"),
+      myOrders: document.getElementById("myOrders"),
+      events: document.getElementById("events")
+    };
+
+    el.market.value = state.market;
+    el.outcome.value = state.outcome;
+    el.user.value = state.user;
+    el.qualityScope.value = state.qualityScope;
+    el.window.value = state.window;
+
+    function pushEvent(msg) {
+      const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      state.events.unshift(line);
+      state.events = state.events.slice(0, 20);
+      el.events.innerHTML = state.events.map((v) => `<li>${v}</li>`).join("");
+    }
+
+    function applyContext() {
+      state.market = el.market.value.trim() || "market-demo";
+      state.outcome = el.outcome.value.trim() || "yes";
+      state.user = el.user.value.trim() || "you-001";
+      state.qualityScope = el.qualityScope.value;
+      state.window = el.window.value;
+      localStorage.setItem("dash_market", state.market);
+      localStorage.setItem("dash_outcome", state.outcome);
+      localStorage.setItem("dash_user", state.user);
+      localStorage.setItem("dash_quality_scope", state.qualityScope);
+      localStorage.setItem("dash_quality_window", state.window);
+      pushEvent(`context ${state.market}/${state.outcome} user=${state.user} quality=${state.qualityScope} ${state.window}`);
+    }
+
+    document.getElementById("apply").addEventListener("click", () => {
+      applyContext();
+      tick();
+    });
+    el.window.addEventListener("change", () => {
+      applyContext();
+      drawQualityChart();
+      renderQuality();
+    });
+    el.qualityScope.addEventListener("change", () => {
+      applyContext();
+      tick();
+    });
+
+    function best(levels) {
+      return (levels && levels[0] && Number(levels[0][0])) || null;
+    }
+
+    async function fetchJson(path, method = "GET", body = null) {
+      const response = await fetch(path, {
+        method,
+        cache: "no-store",
+        headers: body ? { "content-type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined
+      });
+      const text = await response.text();
+      if (!response.ok) throw new Error(`${path} => ${response.status} ${text}`);
+      return text ? JSON.parse(text) : {};
+    }
+
+    function renderLevels(target, levels, side) {
+      const top = (levels || []).slice(0, 10);
+      const maxQty = Math.max(1, ...top.map((x) => Number(x[1] || 0)));
+      target.innerHTML = top.map(([price, qty]) => {
+        const width = Math.max(2, Math.round((Number(qty) / maxQty) * 100));
+        return `<div class="level"><span>${price}</span><span>${qty}</span><div class="bar"><div class="fill ${side}" style="width:${width}%"></div></div></div>`;
+      }).join("") || "<div class='label'>No levels</div>";
+    }
+
+    function orderHowDoing(order, bid, ask) {
+      if (["filled", "rejected", "canceled"].includes(order.status)) return order.status;
+      if (bid == null || ask == null) return "waiting book";
+      if (order.side === "buy") return order.limit_price >= ask ? "marketable now" : `needs ask<=${order.limit_price} (now ${ask})`;
+      return order.limit_price <= bid ? "marketable now" : `needs bid>=${order.limit_price} (now ${bid})`;
+    }
+
+    function renderMyOrders() {
+      const book = state.lastBook || {};
+      const bid = best(book.bids);
+      const ask = best(book.asks);
+      const rows = [...state.myOrders.values()].sort((a, b) => b.created_at - a.created_at).map((o) => {
+        const statusClass = o.status === "filled" ? "good" : (o.status === "rejected" || o.status === "canceled") ? "bad" : "warn";
+        const canCancel = ["accepted", "resting", "partial"].includes(o.status);
+        return `<tr><td>${o.order_id}</td><td>${o.side}</td><td>${o.limit_price}</td><td>${o.qty}</td><td>${o.qty_remaining ?? "-"}</td><td class="${statusClass}">${o.status}</td><td>${orderHowDoing(o, bid, ask)}</td><td>${canCancel ? `<button class='cancel' data-cancel='${o.order_id}'>cancel</button>` : "-"}</td></tr>`;
+      }).join("");
+      el.myOrders.innerHTML = rows || "<tr><td colspan='8' class='label'>No bets yet</td></tr>";
+      el.myOrders.querySelectorAll("button[data-cancel]").forEach((btn) => {
+        btn.addEventListener("click", () => cancelOrder(btn.getAttribute("data-cancel")));
+      });
+    }
+
+    function drawSeries(ctx, values, color, min, max, w, h) {
+      const span = Math.max(1, max - min);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      let started = false;
+      values.forEach((v, i) => {
+        if (v == null) return;
+        const x = (i / Math.max(1, values.length - 1)) * (w - 30) + 15;
+        const y = h - 20 - ((v - min) / span) * (h - 40);
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+      ctx.stroke();
+    }
+
+    function drawQualityChart() {
+      const c = el.qualityChart;
+      const ctx = c.getContext("2d");
+      const w = c.width;
+      const h = c.height;
+      ctx.clearRect(0, 0, w, h);
+      if (state.qualityHistory.length < 2) {
+        ctx.fillStyle = "#8fa0bb";
+        ctx.font = "12px monospace";
+        ctx.fillText("Waiting for quality data...", 16, 24);
+        return;
+      }
+
+      const tput = state.qualityHistory.map((p) => p.throughput);
+      const rejPct = state.qualityHistory.map((p) => p.rejectRate * 100);
+      const lat = state.qualityHistory.map((p) => p.p95);
+      const all = [...tput, ...rejPct, ...lat].filter((v) => Number.isFinite(v));
+      const min = Math.min(...all, 0);
+      const max = Math.max(...all, 1);
+
+      drawSeries(ctx, tput, "#66b3ff", min, max, w, h);
+      drawSeries(ctx, rejPct, "#ff8e55", min, max, w, h);
+      drawSeries(ctx, lat, "#bb9bff", min, max, w, h);
+    }
+
+    function drawPriceChart() {
+      const c = el.priceChart;
+      const ctx = c.getContext("2d");
+      const w = c.width;
+      const h = c.height;
+      ctx.clearRect(0, 0, w, h);
+      if (state.priceHistory.length < 2) {
+        ctx.fillStyle = "#8fa0bb";
+        ctx.font = "12px monospace";
+        ctx.fillText("Waiting for price data...", 16, 24);
+        return;
+      }
+      const bid = state.priceHistory.map((p) => p.bid);
+      const ask = state.priceHistory.map((p) => p.ask);
+      const mid = state.priceHistory.map((p) => p.mid);
+      const all = [...bid, ...ask, ...mid].filter((v) => v != null);
+      const min = Math.min(...all);
+      const max = Math.max(...all);
+      drawSeries(ctx, bid, "#2fbf71", min, max, w, h);
+      drawSeries(ctx, ask, "#f05a5a", min, max, w, h);
+      drawSeries(ctx, mid, "#f1c75b", min, max, w, h);
+    }
+
+    function selectedWindow(snapshot) {
+      return snapshot ? snapshot[state.window] : null;
+    }
+
+    function setSeverity(sev) {
+      el.sev.textContent = String(sev || "ok").toUpperCase();
+      el.sev.className = `value sev ${sev || "ok"}`;
+      if (sev === "critical") {
+        el.alertBanner.style.display = "block";
+        el.alertBanner.textContent = "Critical quality degradation detected in selected window. Check reject reasons and shard balance.";
+      } else {
+        el.alertBanner.style.display = "none";
+      }
+    }
+
+    function renderQuality() {
+      const window = selectedWindow(state.currentQuality);
+      if (!window) return;
+      setSeverity(window.severity);
+      el.throughput.textContent = Number(window.throughput_per_sec || 0).toFixed(2);
+      el.rejectRate.textContent = `${(Number(window.reject_rate || 0) * 100).toFixed(2)}%`;
+      el.latP95.textContent = `${window.processing_latency_ms?.p95 || 0} ms`;
+      el.ingress.textContent = window.ingress_total || 0;
+      el.accepted.textContent = window.accepted_total || 0;
+      el.rejected.textContent = window.rejected_total || 0;
+      el.riskReject.textContent = window.risk_reject_total || 0;
+
+      const reasons = Object.entries(window.reject_reasons || {}).sort((a, b) => b[1] - a[1]);
+      const totalRej = Math.max(1, Number(window.rejected_total || 0));
+      el.reasonRows.innerHTML = reasons.map(([reason, count]) => {
+        const share = (count / totalRej) * 100;
+        return `<tr><td>${reason}</td><td>${count}</td><td>${share.toFixed(1)}%</td></tr>`;
+      }).join("") || "<tr><td colspan='3' class='label'>No rejections in this window</td></tr>";
+
+      const shardVec = window.shard_balance?.processed_by_shard || [];
+      const shardText = shardVec.length ? shardVec.map((v, i) => `shard ${i}: ${v}`).join(" | ") : "no accepted flow sampled";
+      el.shards.textContent = `${shardText}  (imbalance=${Number(window.shard_balance?.imbalance_ratio || 1).toFixed(2)})`;
+
+      const s = window.streaming || {};
+      el.streamDeltas.textContent = `delivered=${s.delivered || 0}, depth_dropped=${s.depth_dropped || 0}, slow_disconnects=${s.slow_consumer_disconnects || 0}, unauthorized=${s.unauthorized || 0}`;
+    }
+
+    async function placeOrder() {
+      if (state.inFlight) return;
+      state.inFlight = true;
+      try {
+        const ts = Date.now();
+        const orderId = `ui-ord-${ts}-${Math.floor(Math.random() * 9999)}`;
+        const payload = {
+          command_id: `ui-cmd-place-${ts}-${Math.floor(Math.random() * 9999)}`,
+          market_id: state.market,
+          outcome_id: state.outcome,
+          user_id: state.user,
+          order_id: orderId,
+          side: el.side.value,
+          order_type: "limit",
+          limit_price: Number(el.price.value),
+          qty: Number(el.qty.value)
+        };
+        const out = await fetchJson("/orders", "POST", payload);
+        const record = { order_id: orderId, side: payload.side, limit_price: payload.limit_price, qty: payload.qty, qty_remaining: payload.qty, status: "accepted", created_at: ts, pending_cancel: false };
+        (out.events || []).forEach((ev) => {
+          if (ev.type === "order_rejected") record.status = "rejected";
+          if (ev.type === "order_rested") { record.status = "resting"; record.qty_remaining = ev.qty_remaining; }
+          if (ev.type === "order_partial") { record.status = "partial"; record.qty_remaining = ev.qty_remaining; }
+          if (ev.type === "order_filled") { record.status = "filled"; record.qty_remaining = 0; }
+        });
+        state.myOrders.set(orderId, record);
+        el.tradeMsg.textContent = `placed ${orderId}`;
+        pushEvent(`placed ${orderId} ${payload.side} ${payload.qty}@${payload.limit_price}`);
+        renderMyOrders();
+      } catch (err) {
+        el.tradeMsg.textContent = `place failed: ${err.message}`;
+        pushEvent(`place failed: ${err.message}`);
+      } finally {
+        state.inFlight = false;
+      }
+    }
+
+    async function cancelOrder(orderId) {
+      const order = state.myOrders.get(orderId);
+      if (!order) return;
+      try {
+        const ts = Date.now();
+        const payload = { command_id: `ui-cmd-cancel-${ts}-${Math.floor(Math.random() * 9999)}`, market_id: state.market, outcome_id: state.outcome, user_id: state.user };
+        const out = await fetchJson(`/orders/${encodeURIComponent(orderId)}`, "DELETE", payload);
+        order.pending_cancel = true;
+        (out.events || []).forEach((ev) => {
+          if (ev.type === "order_canceled") order.status = "canceled";
+          if (ev.type === "order_partial") { order.status = "partial"; order.qty_remaining = ev.qty_remaining; }
+          if (ev.type === "order_filled") { order.status = "filled"; order.qty_remaining = 0; }
+        });
+        pushEvent(`cancel ${orderId}`);
+        renderMyOrders();
+      } catch (err) {
+        pushEvent(`cancel failed ${orderId}: ${err.message}`);
+      }
+    }
+
+    el.place.addEventListener("click", placeOrder);
+
+    async function tick() {
+      try {
+        const qualityQuery = state.qualityScope === "filtered"
+          ? `?market_id=${encodeURIComponent(state.market)}&outcome_id=${encodeURIComponent(state.outcome)}&user_id=${encodeURIComponent(state.user)}`
+          : "";
+
+        const [quality, book] = await Promise.all([
+          fetchJson(`/admin/quality${qualityQuery}`),
+          fetchJson(`/books/${encodeURIComponent(state.market)}/${encodeURIComponent(state.outcome)}`)
+        ]);
+
+        state.currentQuality = quality;
+        const window = selectedWindow(quality);
+        if (window) {
+          state.qualityHistory.push({
+            throughput: Number(window.throughput_per_sec || 0),
+            rejectRate: Number(window.reject_rate || 0),
+            p95: Number(window.processing_latency_ms?.p95 || 0)
+          });
+          state.qualityHistory = state.qualityHistory.slice(-state.maxPoints);
+        }
+
+        state.lastBook = book;
+        const bid = best(book.bids);
+        const ask = best(book.asks);
+        const mid = (bid != null && ask != null) ? Math.round((bid + ask) / 2) : null;
+        state.priceHistory.push({ bid, ask, mid });
+        state.priceHistory = state.priceHistory.slice(-state.maxPoints);
+
+        renderLevels(el.bids, book.bids || [], "bid");
+        renderLevels(el.asks, book.asks || [], "ask");
+
+        const openOrders = (book.open_orders || []).filter((o) => o.user_id === state.user);
+        const openSet = new Set(openOrders.map((o) => o.order_id));
+        for (const order of state.myOrders.values()) {
+          if (["accepted", "resting", "partial"].includes(order.status) && !openSet.has(order.order_id)) {
+            order.status = order.pending_cancel ? "canceled" : (order.qty_remaining === 0 ? "filled" : "filled");
+          }
+        }
+
+        renderQuality();
+        renderMyOrders();
+        drawQualityChart();
+        drawPriceChart();
+      } catch (err) {
+        pushEvent(`poll failed: ${err.message}`);
+      }
+    }
+
+    applyContext();
+    tick();
+    setInterval(tick, 1000);
+  </script>
+</body>
+</html>

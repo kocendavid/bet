@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::book::BookState;
 use crate::ledger::{FillIntent, LedgerAdapter, LedgerError, ReservationKindLocal};
 use crate::persistence::Storage;
+use crate::quality::QualityCollector;
 use crate::risk::{check_place_risk, RiskLimits};
 use crate::service::MatcherService;
 use crate::types::{Command, CommandResult, Event};
@@ -79,6 +80,7 @@ pub struct ShardRuntime<L: LedgerAdapter + Clone + 'static> {
     processed: Vec<Arc<AtomicU64>>,
     rejected: Vec<Arc<AtomicU64>>,
     risk_rejects: Arc<AtomicU64>,
+    quality: Arc<QualityCollector>,
     _ledger: std::marker::PhantomData<L>,
 }
 
@@ -97,6 +99,7 @@ impl<L: LedgerAdapter + Clone + 'static> ShardRuntime<L> {
         let base_data_dir = base_data_dir.into();
         let state = Arc::new(Mutex::new(RuntimeState::new()));
         let risk_rejects = Arc::new(AtomicU64::new(0));
+        let quality = Arc::new(QualityCollector::new());
         let mut senders = Vec::with_capacity(shard_count);
         let mut processed = Vec::with_capacity(shard_count);
         let mut rejected = Vec::with_capacity(shard_count);
@@ -200,6 +203,7 @@ impl<L: LedgerAdapter + Clone + 'static> ShardRuntime<L> {
             processed,
             rejected,
             risk_rejects,
+            quality,
             _ledger: std::marker::PhantomData,
         })
     }
@@ -222,6 +226,7 @@ impl<L: LedgerAdapter + Clone + 'static> ShardRuntime<L> {
     }
 
     pub async fn process(&self, command: Command) -> anyhow::Result<CommandResult> {
+        let started_at = std::time::Instant::now();
         let (market_id, order_id, command_id) = match &command {
             Command::Place(place) => (
                 place.market_id.as_str(),
@@ -236,25 +241,43 @@ impl<L: LedgerAdapter + Clone + 'static> ShardRuntime<L> {
         };
 
         if market_id.is_empty() {
-            return Ok(CommandResult {
+            let out = CommandResult {
                 command_id,
                 events: vec![Event::OrderRejected {
                     order_id,
                     reason: "invalid_market_metadata".into(),
                 }],
-            });
+            };
+            self.quality
+                .record_command(
+                    &command,
+                    None,
+                    started_at.elapsed().as_millis() as u64,
+                    &out,
+                )
+                .await;
+            return Ok(out);
         }
 
         let shard = {
             let state = self.state.lock().await;
             if state.frozen_markets.contains(market_id) {
-                return Ok(CommandResult {
+                let out = CommandResult {
                     command_id,
                     events: vec![Event::OrderRejected {
                         order_id,
                         reason: "market_migrating".into(),
                     }],
-                });
+                };
+                self.quality
+                    .record_command(
+                        &command,
+                        None,
+                        started_at.elapsed().as_millis() as u64,
+                        &out,
+                    )
+                    .await;
+                return Ok(out);
             }
             state
                 .overrides
@@ -263,6 +286,7 @@ impl<L: LedgerAdapter + Clone + 'static> ShardRuntime<L> {
                 .unwrap_or_else(|| self.route_market(market_id))
         };
 
+        let command_for_quality = command.clone();
         let (tx, rx) = oneshot::channel();
         self.senders[shard]
             .send(ShardMessage::Process {
@@ -271,8 +295,18 @@ impl<L: LedgerAdapter + Clone + 'static> ShardRuntime<L> {
             })
             .await
             .map_err(|_| anyhow!("shard {shard} queue closed"))?;
-        rx.await
-            .map_err(|_| anyhow!("shard {shard} dropped response"))?
+        let out = rx
+            .await
+            .map_err(|_| anyhow!("shard {shard} dropped response"))??;
+        self.quality
+            .record_command(
+                &command_for_quality,
+                Some(shard),
+                started_at.elapsed().as_millis() as u64,
+                &out,
+            )
+            .await;
+        Ok(out)
     }
 
     pub async fn get_book(
@@ -376,6 +410,10 @@ impl<L: LedgerAdapter + Clone + 'static> ShardRuntime<L> {
 
     pub fn risk_limits(&self) -> &RiskLimits {
         &self.risk_limits
+    }
+
+    pub fn quality(&self) -> Arc<QualityCollector> {
+        self.quality.clone()
     }
 }
 

@@ -4,6 +4,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
+use axum::response::Html;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -13,6 +14,7 @@ use crate::admin::{
     FinalizeResolutionRequest, ProposeResolutionRequest, SettleMarketRequest,
 };
 use crate::ledger::LedgerAdapter;
+use crate::quality::QualityFilter;
 use crate::sharding::ShardRuntime;
 use crate::streaming::{
     ChannelKind, StreamHub, StreamSubscription, SubscribeError, SubscriptionRequest, WsAuthorizer,
@@ -33,12 +35,14 @@ pub struct AppState<L: LedgerAdapter + Clone + 'static> {
 
 pub fn router<L: LedgerAdapter + Clone + 'static>(state: AppState<L>) -> Router {
     Router::new()
+        .route("/dashboard", get(dashboard))
         .route("/orders", post(place_order::<L>))
         .route("/orders/{order_id}", delete(cancel_order::<L>))
         .route("/books/{market_id}/{outcome_id}", get(get_book::<L>))
         .route("/ws", get(ws_stream::<L>))
         .route("/admin/migrate", post(migrate_market::<L>))
         .route("/admin/metrics", get(get_metrics::<L>))
+        .route("/admin/quality", get(get_quality::<L>))
         .route("/admin/routing/{market_id}", get(get_routing::<L>))
         .route("/admin/markets", post(create_market::<L>))
         .route(
@@ -58,6 +62,10 @@ pub fn router<L: LedgerAdapter + Clone + 'static>(state: AppState<L>) -> Router 
             post(settle_market::<L>),
         )
         .with_state(state)
+}
+
+async fn dashboard() -> Html<&'static str> {
+    Html(include_str!("../static/dashboard.html"))
 }
 
 async fn place_order<L: LedgerAdapter + Clone>(
@@ -214,6 +222,33 @@ async fn get_metrics<L: LedgerAdapter + Clone>(
             "max_tick": state.runtime.risk_limits().max_tick
         }
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct QualityQuery {
+    market_id: Option<String>,
+    outcome_id: Option<String>,
+    user_id: Option<String>,
+}
+
+async fn get_quality<L: LedgerAdapter + Clone>(
+    Query(query): Query<QualityQuery>,
+    State(state): State<AppState<L>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let stream_metrics = state.stream_hub.metrics_snapshot().await;
+    let snapshot = state
+        .runtime
+        .quality()
+        .snapshot(
+            QualityFilter {
+                market_id: query.market_id.filter(|v| !v.trim().is_empty()),
+                outcome_id: query.outcome_id.filter(|v| !v.trim().is_empty()),
+                user_id: query.user_id.filter(|v| !v.trim().is_empty()),
+            },
+            stream_metrics,
+        )
+        .await;
+    Ok(Json(serde_json::json!(snapshot)))
 }
 
 async fn get_routing<L: LedgerAdapter + Clone>(

@@ -4,6 +4,7 @@ pub mod http;
 pub mod kafka;
 pub mod ledger;
 pub mod persistence;
+pub mod quality;
 pub mod risk;
 pub mod service;
 pub mod sharding;
