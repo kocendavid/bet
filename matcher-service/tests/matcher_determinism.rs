@@ -55,8 +55,11 @@ impl LedgerAdapter for MockLedger {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn place(
     cmd_id: &str,
+    market_id: &str,
+    outcome_id: &str,
     user: &str,
     order: &str,
     side: Side,
@@ -66,6 +69,8 @@ fn place(
 ) -> Command {
     Command::Place(PlaceOrder {
         command_id: cmd_id.into(),
+        market_id: market_id.into(),
+        outcome_id: outcome_id.into(),
         user_id: user.into(),
         order_id: order.into(),
         side,
@@ -81,21 +86,55 @@ async fn replay_determinism_state_hash_stable() {
     let storage = Storage::new(dir.path());
     let ledger = MockLedger::default();
 
-    let mut svc = MatcherService::new(
-        "m1".into(),
-        "o1".into(),
-        storage.clone(),
-        ledger.clone(),
-        0,
-    )
-    .await
-    .unwrap();
+    let mut svc = MatcherService::new("m1".into(), "o1".into(), storage.clone(), ledger.clone(), 0)
+        .await
+        .unwrap();
 
     let cmds = vec![
-        place("c1", "u1", "o1", Side::Sell, OrderType::Limit, 6000, 5),
-        place("c2", "u2", "o2", Side::Sell, OrderType::Limit, 6200, 4),
-        place("c3", "u3", "o3", Side::Buy, OrderType::Limit, 6200, 6),
-        place("c4", "u4", "o4", Side::Buy, OrderType::Ioc, 6100, 5),
+        place(
+            "c1",
+            "m1",
+            "o1",
+            "u1",
+            "o1",
+            Side::Sell,
+            OrderType::Limit,
+            6000,
+            5,
+        ),
+        place(
+            "c2",
+            "m1",
+            "o1",
+            "u2",
+            "o2",
+            Side::Sell,
+            OrderType::Limit,
+            6200,
+            4,
+        ),
+        place(
+            "c3",
+            "m1",
+            "o1",
+            "u3",
+            "o3",
+            Side::Buy,
+            OrderType::Limit,
+            6200,
+            6,
+        ),
+        place(
+            "c4",
+            "m1",
+            "o1",
+            "u4",
+            "o4",
+            Side::Buy,
+            OrderType::Ioc,
+            6100,
+            5,
+        ),
     ];
 
     for c in cmds {
@@ -103,15 +142,9 @@ async fn replay_determinism_state_hash_stable() {
     }
     let hash_a = svc.book.state_hash();
 
-    let svc2 = MatcherService::new(
-        "m1".into(),
-        "o1".into(),
-        storage.clone(),
-        ledger.clone(),
-        0,
-    )
-    .await
-    .unwrap();
+    let svc2 = MatcherService::new("m1".into(), "o1".into(), storage.clone(), ledger.clone(), 0)
+        .await
+        .unwrap();
 
     let hash_b = svc2.book.state_hash();
     assert_eq!(hash_a, hash_b);
@@ -126,15 +159,45 @@ async fn multi_level_crossing_and_partial_rest() {
         .await
         .unwrap();
 
-    svc.process(place("c1", "s1", "ask1", Side::Sell, OrderType::Limit, 5000, 4))
-        .await
-        .unwrap();
-    svc.process(place("c2", "s2", "ask2", Side::Sell, OrderType::Limit, 5100, 3))
-        .await
-        .unwrap();
+    svc.process(place(
+        "c1",
+        "m",
+        "o",
+        "s1",
+        "ask1",
+        Side::Sell,
+        OrderType::Limit,
+        5000,
+        4,
+    ))
+    .await
+    .unwrap();
+    svc.process(place(
+        "c2",
+        "m",
+        "o",
+        "s2",
+        "ask2",
+        Side::Sell,
+        OrderType::Limit,
+        5100,
+        3,
+    ))
+    .await
+    .unwrap();
 
     let out = svc
-        .process(place("c3", "b1", "bid1", Side::Buy, OrderType::Limit, 5200, 10))
+        .process(place(
+            "c3",
+            "m",
+            "o",
+            "b1",
+            "bid1",
+            Side::Buy,
+            OrderType::Limit,
+            5200,
+            10,
+        ))
         .await
         .unwrap();
 
@@ -159,11 +222,31 @@ async fn ioc_remainder_canceled_not_rested() {
         .await
         .unwrap();
 
-    svc.process(place("c1", "s1", "ask1", Side::Sell, OrderType::Limit, 5000, 2))
-        .await
-        .unwrap();
+    svc.process(place(
+        "c1",
+        "m",
+        "o",
+        "s1",
+        "ask1",
+        Side::Sell,
+        OrderType::Limit,
+        5000,
+        2,
+    ))
+    .await
+    .unwrap();
     let out = svc
-        .process(place("c2", "b1", "ioc1", Side::Buy, OrderType::Ioc, 5000, 5))
+        .process(place(
+            "c2",
+            "m",
+            "o",
+            "b1",
+            "ioc1",
+            Side::Buy,
+            OrderType::Ioc,
+            5000,
+            5,
+        ))
         .await
         .unwrap();
 
@@ -186,15 +269,45 @@ async fn self_trade_skip_deterministic() {
         .await
         .unwrap();
 
-    svc.process(place("c1", "u1", "ask_self", Side::Sell, OrderType::Limit, 4900, 3))
-        .await
-        .unwrap();
-    svc.process(place("c2", "u2", "ask_other", Side::Sell, OrderType::Limit, 5000, 2))
-        .await
-        .unwrap();
+    svc.process(place(
+        "c1",
+        "m",
+        "o",
+        "u1",
+        "ask_self",
+        Side::Sell,
+        OrderType::Limit,
+        4900,
+        3,
+    ))
+    .await
+    .unwrap();
+    svc.process(place(
+        "c2",
+        "m",
+        "o",
+        "u2",
+        "ask_other",
+        Side::Sell,
+        OrderType::Limit,
+        5000,
+        2,
+    ))
+    .await
+    .unwrap();
 
     let out = svc
-        .process(place("c3", "u1", "buy1", Side::Buy, OrderType::Limit, 5000, 4))
+        .process(place(
+            "c3",
+            "m",
+            "o",
+            "u1",
+            "buy1",
+            Side::Buy,
+            OrderType::Limit,
+            5000,
+            4,
+        ))
         .await
         .unwrap();
 
@@ -226,6 +339,8 @@ async fn reservation_reject_does_not_mutate_book() {
     let out = svc
         .process(place(
             "c1",
+            "m",
+            "o",
             "u1",
             "bad-order",
             Side::Buy,

@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crate::pb::ledger_service_client::LedgerServiceClient;
 use crate::pb::{
-    AdjustReservationRequest, ApplyFillRequest, Party, ReleaseReservationRequest,
-    ReservationKind, ReserveForOrderRequest, Side as LedgerSide,
+    AdjustReservationRequest, ApplyFillRequest, Party, ReleaseReservationRequest, ReservationKind,
+    ReserveForOrderRequest, Side as LedgerSide,
 };
 use thiserror::Error;
 use tonic::transport::Channel;
@@ -147,11 +147,13 @@ impl LedgerAdapter for GrpcLedgerAdapter {
             amount_czk,
         };
 
-        let resp = self.with_retry(|| {
-            let mut c = client.clone();
-            let r = req.clone();
-            async move { c.reserve_for_order(r).await.map(|r| r.into_inner()) }
-        }).await?;
+        let resp = self
+            .with_retry(|| {
+                let mut c = client.clone();
+                let r = req.clone();
+                async move { c.reserve_for_order(r).await.map(|r| r.into_inner()) }
+            })
+            .await?;
 
         if !resp.ok {
             return Err(LedgerError::Rejected(resp.reason));
@@ -170,11 +172,13 @@ impl LedgerAdapter for GrpcLedgerAdapter {
             reservation_id: order_id.to_string(),
         };
 
-        let resp = self.with_retry(|| {
-            let mut c = client.clone();
-            let r = req.clone();
-            async move { c.release_reservation(r).await.map(|r| r.into_inner()) }
-        }).await?;
+        let resp = self
+            .with_retry(|| {
+                let mut c = client.clone();
+                let r = req.clone();
+                async move { c.release_reservation(r).await.map(|r| r.into_inner()) }
+            })
+            .await?;
         if !resp.ok {
             return Err(LedgerError::Rejected(resp.reason));
         }
@@ -194,11 +198,13 @@ impl LedgerAdapter for GrpcLedgerAdapter {
             delta_czk,
         };
 
-        let resp = self.with_retry(|| {
-            let mut c = client.clone();
-            let r = req.clone();
-            async move { c.adjust_reservation(r).await.map(|r| r.into_inner()) }
-        }).await?;
+        let resp = self
+            .with_retry(|| {
+                let mut c = client.clone();
+                let r = req.clone();
+                async move { c.adjust_reservation(r).await.map(|r| r.into_inner()) }
+            })
+            .await?;
         if !resp.ok {
             return Err(LedgerError::Rejected(resp.reason));
         }
@@ -232,11 +238,13 @@ impl LedgerAdapter for GrpcLedgerAdapter {
             fee_bps: self.fee_bps,
         };
 
-        let resp = self.with_retry(|| {
-            let mut c = client.clone();
-            let r = req.clone();
-            async move { c.apply_fill(r).await.map(|r| r.into_inner()) }
-        }).await?;
+        let resp = self
+            .with_retry(|| {
+                let mut c = client.clone();
+                let r = req.clone();
+                async move { c.apply_fill(r).await.map(|r| r.into_inner()) }
+            })
+            .await?;
         if !resp.ok {
             return Err(LedgerError::Rejected(resp.reason));
         }

@@ -57,6 +57,55 @@ impl<L: LedgerAdapter> MatcherService<L> {
         self.process_internal(command, true).await
     }
 
+    pub async fn replay(&mut self, command: Command) -> anyhow::Result<CommandResult> {
+        self.process_internal(command, false).await
+    }
+
+    pub fn state_hash(&self) -> String {
+        self.book.state_hash()
+    }
+
+    pub fn market_id(&self) -> &str {
+        &self.market_id
+    }
+
+    pub fn outcome_id(&self) -> &str {
+        &self.outcome_id
+    }
+
+    pub fn export_snapshot(&self) -> (BookState, Vec<String>) {
+        let processed_ids: Vec<String> = self.processed_set.iter().cloned().collect();
+        (self.book.clone(), processed_ids)
+    }
+
+    pub async fn read_all_commands(&self) -> anyhow::Result<Vec<Command>> {
+        self.storage.read_all_commands().await
+    }
+
+    pub async fn from_snapshot(
+        storage: Storage,
+        ledger: L,
+        snapshot_every: u64,
+        book: BookState,
+        processed_command_ids: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        storage
+            .write_snapshot(&book, &processed_command_ids)
+            .await
+            .context("write imported snapshot")?;
+
+        Ok(Self {
+            market_id: book.market_id.clone(),
+            outcome_id: book.outcome_id.clone(),
+            book,
+            storage,
+            ledger,
+            processed: HashMap::new(),
+            processed_set: processed_command_ids.into_iter().collect(),
+            snapshot_every,
+        })
+    }
+
     async fn process_internal(
         &mut self,
         command: Command,
@@ -66,6 +115,23 @@ impl<L: LedgerAdapter> MatcherService<L> {
             Command::Place(p) => p.command_id.clone(),
             Command::Cancel(c) => c.command_id.clone(),
         };
+
+        let (market_id, outcome_id) = match &command {
+            Command::Place(p) => (&p.market_id, &p.outcome_id),
+            Command::Cancel(c) => (&c.market_id, &c.outcome_id),
+        };
+        if market_id != &self.market_id || outcome_id != &self.outcome_id {
+            return Ok(CommandResult {
+                command_id,
+                events: vec![Event::OrderRejected {
+                    order_id: match &command {
+                        Command::Place(p) => p.order_id.clone(),
+                        Command::Cancel(c) => c.order_id.clone(),
+                    },
+                    reason: "market/outcome mismatch".into(),
+                }],
+            });
+        }
 
         if let Some(events) = self.processed.get(&command_id) {
             return Ok(CommandResult {
@@ -97,7 +163,10 @@ impl<L: LedgerAdapter> MatcherService<L> {
         self.processed.insert(command_id.clone(), events.clone());
         self.processed_set.insert(command_id.clone());
 
-        if persist && self.snapshot_every != 0 && self.book.command_seq % self.snapshot_every == 0 {
+        if persist
+            && self.snapshot_every != 0
+            && self.book.command_seq.is_multiple_of(self.snapshot_every)
+        {
             let processed_ids: Vec<String> = self.processed_set.iter().cloned().collect();
             self.storage
                 .write_snapshot(&self.book, &processed_ids)
@@ -212,7 +281,10 @@ impl<L: LedgerAdapter> MatcherService<L> {
                     .release_reservation(&format!("{}:release-ioc", cmd.command_id), &cmd.order_id)
                     .await
                 {
-                    warn!("release reservation failed for IOC {}: {}", cmd.order_id, err);
+                    warn!(
+                        "release reservation failed for IOC {}: {}",
+                        cmd.order_id, err
+                    );
                 }
             }
         }

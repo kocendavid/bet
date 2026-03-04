@@ -19,6 +19,8 @@ pub enum OrderType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaceOrder {
     pub command_id: String,
+    pub market_id: String,
+    pub outcome_id: String,
     pub user_id: String,
     pub order_id: String,
     pub side: Side,
@@ -30,6 +32,8 @@ pub struct PlaceOrder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelOrder {
     pub command_id: String,
+    pub market_id: String,
+    pub outcome_id: String,
     pub user_id: String,
     pub order_id: String,
 }
@@ -43,10 +47,20 @@ pub enum Command {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    OrderAccepted { order_id: String },
-    OrderRejected { order_id: String, reason: String },
-    OrderRested { order_id: String, qty_remaining: i64 },
-    OrderCanceled { order_id: String },
+    OrderAccepted {
+        order_id: String,
+    },
+    OrderRejected {
+        order_id: String,
+        reason: String,
+    },
+    OrderRested {
+        order_id: String,
+        qty_remaining: i64,
+    },
+    OrderCanceled {
+        order_id: String,
+    },
     TradeExecuted {
         fill_id: String,
         maker_order_id: String,
@@ -54,8 +68,13 @@ pub enum Event {
         price: i64,
         qty: i64,
     },
-    OrderPartial { order_id: String, qty_remaining: i64 },
-    OrderFilled { order_id: String },
+    OrderPartial {
+        order_id: String,
+        qty_remaining: i64,
+    },
+    OrderFilled {
+        order_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

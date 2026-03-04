@@ -85,7 +85,7 @@ mod tests {
                 let mut reserved = reserve;
 
                 // reserve
-                let reserve_amt = (available_start % 4) as i64;
+                let reserve_amt = available_start % 4;
                 if available >= reserve_amt {
                     available -= reserve_amt;
                     reserved += reserve_amt;
@@ -93,7 +93,7 @@ mod tests {
                 assert!(available >= 0 && reserved >= 0);
 
                 // spend from reserved first, then available
-                let spend = (available_start % 5) as i64;
+                let spend = available_start % 5;
                 let total = available + reserved;
                 if total >= spend {
                     let consume_reserved = reserved.min(spend);

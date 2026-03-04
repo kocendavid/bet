@@ -40,24 +40,32 @@ mod pb_command {
 #[derive(Clone, PartialEq, Message)]
 struct PbPlace {
     #[prost(string, tag = "1")]
-    user_id: String,
+    market_id: String,
     #[prost(string, tag = "2")]
+    outcome_id: String,
+    #[prost(string, tag = "3")]
+    user_id: String,
+    #[prost(string, tag = "4")]
     order_id: String,
-    #[prost(int32, tag = "3")]
+    #[prost(int32, tag = "5")]
     side: i32,
-    #[prost(int32, tag = "4")]
+    #[prost(int32, tag = "6")]
     order_type: i32,
-    #[prost(int64, tag = "5")]
+    #[prost(int64, tag = "7")]
     limit_price: i64,
-    #[prost(int64, tag = "6")]
+    #[prost(int64, tag = "8")]
     qty: i64,
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct PbCancel {
     #[prost(string, tag = "1")]
-    user_id: String,
+    market_id: String,
     #[prost(string, tag = "2")]
+    outcome_id: String,
+    #[prost(string, tag = "3")]
+    user_id: String,
+    #[prost(string, tag = "4")]
     order_id: String,
 }
 
@@ -180,11 +188,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn load(
-        &self,
-        market_id: String,
-        outcome_id: String,
-    ) -> anyhow::Result<LoadedState> {
+    pub async fn load(&self, market_id: String, outcome_id: String) -> anyhow::Result<LoadedState> {
         let mut book = BookState::new(market_id, outcome_id);
         let mut processed = Vec::new();
 
@@ -259,6 +263,10 @@ impl Storage {
 
         Ok(commands)
     }
+
+    pub async fn read_all_commands(&self) -> anyhow::Result<Vec<Command>> {
+        self.read_log_suffix(0).await
+    }
 }
 
 fn command_to_pb(command: &Command) -> PbCommand {
@@ -266,6 +274,8 @@ fn command_to_pb(command: &Command) -> PbCommand {
         Command::Place(c) => PbCommand {
             command_id: c.command_id.clone(),
             kind: Some(pb_command::Kind::Place(PbPlace {
+                market_id: c.market_id.clone(),
+                outcome_id: c.outcome_id.clone(),
                 user_id: c.user_id.clone(),
                 order_id: c.order_id.clone(),
                 side: side_to_i32(c.side),
@@ -277,6 +287,8 @@ fn command_to_pb(command: &Command) -> PbCommand {
         Command::Cancel(c) => PbCommand {
             command_id: c.command_id.clone(),
             kind: Some(pb_command::Kind::Cancel(PbCancel {
+                market_id: c.market_id.clone(),
+                outcome_id: c.outcome_id.clone(),
                 user_id: c.user_id.clone(),
                 order_id: c.order_id.clone(),
             })),
@@ -289,6 +301,8 @@ fn pb_to_command(pb: PbCommand) -> anyhow::Result<Command> {
     Ok(match kind {
         pb_command::Kind::Place(p) => Command::Place(PlaceOrder {
             command_id: pb.command_id,
+            market_id: p.market_id,
+            outcome_id: p.outcome_id,
             user_id: p.user_id,
             order_id: p.order_id,
             side: side_from_i32(p.side)?,
@@ -298,6 +312,8 @@ fn pb_to_command(pb: PbCommand) -> anyhow::Result<Command> {
         }),
         pb_command::Kind::Cancel(c) => Command::Cancel(CancelOrder {
             command_id: pb.command_id,
+            market_id: c.market_id,
+            outcome_id: c.outcome_id,
             user_id: c.user_id,
             order_id: c.order_id,
         }),
